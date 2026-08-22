@@ -15,12 +15,15 @@ import math
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import shutil
 import socket
 import ssl
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
@@ -48,6 +51,10 @@ MAX_BROWSER_NAME_LENGTH = 512
 MAX_BROWSER_ICON_LENGTH = 1024
 MAX_PATH_LENGTH = 4096
 MAX_SETTINGS_BYTES = 16 * 1024
+MAX_MENU_EXTENSION_BYTES = 1024 * 1024
+MAX_CLIPBOARD_BYTES = MAX_URL_LENGTH * 4
+MAX_PLUGIN_LIST_OUTPUT = 1024 * 1024
+MAX_DEFAULT_BROWSER_OUTPUT = 16 * 1024
 MAX_ICON_CANDIDATES = 8
 MAX_FETCH_REDIRECTS = 3
 MAX_FETCH_ADDRESSES = 4
@@ -61,6 +68,89 @@ MENU_MARKER_END = "END stefanmara.bookmarks managed menu entry"
 SETTINGS_VERSION = 1
 
 
+class BoundedOutputError(ValueError):
+    """A child process exceeded its declared output budget."""
+
+
+def run_bounded_process(
+    command: list[str],
+    *,
+    output_limit: int,
+    timeout: float,
+    input_data: bytes | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Capture stdout without allowing a child to fill unbounded memory."""
+    if output_limit < 0 or timeout <= 0:
+        raise ValueError("Process limits must be positive")
+
+    input_stream = None
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    output = bytearray()
+    try:
+        if input_data is not None:
+            input_stream = tempfile.TemporaryFile()
+            input_stream.write(input_data)
+            input_stream.seek(0)
+
+        deadline = time.monotonic() + timeout
+        process = subprocess.Popen(
+            command,
+            stdin=input_stream if input_stream is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+        if process.stdout is None:
+            raise OSError("Could not capture process output")
+        selector.register(process.stdout, selectors.EVENT_READ)
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(command, timeout)
+            chunk = os.read(
+                process.stdout.fileno(),
+                min(64 * 1024, output_limit + 1 - len(output)),
+            )
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > output_limit:
+                raise BoundedOutputError("Process output is too large")
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return_code = process.wait(timeout=remaining)
+        return subprocess.CompletedProcess(command, return_code, bytes(output), None)
+    finally:
+        selector.close()
+        if process is not None:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+        if input_stream is not None:
+            input_stream.close()
+
+
 def read_limited_text(path: Path, limit: int, description: str) -> str:
     """Read a UTF-8 text file without ever buffering more than limit bytes."""
     with path.open("rb") as stream:
@@ -71,9 +161,49 @@ def read_limited_text(path: Path, limit: int, description: str) -> str:
 
 
 def _strip_omarchy_jsonc(value: str) -> str:
-    """Match the JSONC subset understood by Omarchy's menu loader."""
-    value = re.sub(r"^\s*//[^\n]*(\n|$)", "", value, flags=re.MULTILINE)
-    return re.sub(r",(\s*[}\]])", r"\1", value)
+    """Strip the supported JSONC subset with bounded linear scans."""
+    uncommented: list[str] = []
+    for line in value.splitlines(keepends=True):
+        if line.lstrip(" \t").startswith("//"):
+            if line.endswith("\r\n"):
+                uncommented.append("\r\n")
+            elif line.endswith("\n") or line.endswith("\r"):
+                uncommented.append(line[-1])
+            continue
+        uncommented.append(line)
+
+    source = "".join(uncommented)
+    output: list[str] = []
+    index = 0
+    inside_string = False
+    escaped = False
+    while index < len(source):
+        character = source[index]
+        if inside_string:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                inside_string = False
+            index += 1
+            continue
+        if character == '"':
+            inside_string = True
+            output.append(character)
+            index += 1
+            continue
+        if character == ",":
+            lookahead = index + 1
+            while lookahead < len(source) and source[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(source) and source[lookahead] in "}]":
+                index += 1
+                continue
+        output.append(character)
+        index += 1
+    return "".join(output)
 
 
 def _jsonc_tokens(value: str) -> list[dict[str, Any]]:
@@ -213,14 +343,30 @@ def _menu_object_bounds(value: str) -> tuple[int, int, str, str]:
 
 
 def _remove_managed_menu_entry(value: str) -> tuple[str, bool]:
-    pattern = re.compile(
-        r"^[ \t]*// " + re.escape(MENU_MARKER_BEGIN) + r"\n"
-        r".*?"
-        r"^[ \t]*// " + re.escape(MENU_MARKER_END) + r"(?:\n|$)",
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    updated, count = pattern.subn("", value)
-    return updated, count > 0
+    """Remove complete managed blocks in one pass without backtracking."""
+    begin = "// " + MENU_MARKER_BEGIN
+    end = "// " + MENU_MARKER_END
+    output: list[str] = []
+    inside = False
+    removed = False
+    for line in value.splitlines(keepends=True):
+        marker = line.rstrip("\r\n").lstrip(" \t")
+        if marker == begin:
+            if inside:
+                raise ValueError("Omarchy menu extension has nested Bookmarks entries")
+            inside = True
+            continue
+        if marker == end:
+            if not inside:
+                raise ValueError("Omarchy menu extension has an incomplete Bookmarks entry")
+            inside = False
+            removed = True
+            continue
+        if not inside:
+            output.append(line)
+    if inside:
+        raise ValueError("Omarchy menu extension has an incomplete Bookmarks entry")
+    return "".join(output), removed
 
 
 def _atomic_write_text(path: Path, value: str, mode: int) -> None:
@@ -250,7 +396,11 @@ def manage_menu_entry(menu_path: str, install: bool) -> dict[str, Any]:
     if path.exists() and not path.is_file():
         raise ValueError("Omarchy menu extension path is not a regular file")
 
-    original = path.read_text(encoding="utf-8") if path.exists() else "{}\n"
+    original = (
+        read_limited_text(path, MAX_MENU_EXTENSION_BYTES, "Omarchy menu extension")
+        if path.exists()
+        else "{}\n"
+    )
     mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
     without_entry, removed = _remove_managed_menu_entry(original)
 
@@ -288,6 +438,8 @@ def manage_menu_entry(menu_path: str, install: bool) -> dict[str, Any]:
     if prefix and not prefix.endswith("\n"):
         block = "\n" + block
     updated = prefix + block + without_entry[insertion:]
+    if len(updated.encode("utf-8")) > MAX_MENU_EXTENSION_BYTES:
+        raise ValueError("Omarchy menu extension is too large")
     json.loads(_strip_omarchy_jsonc(updated))
     changed = updated != original
     if changed:
@@ -302,7 +454,7 @@ def menu_entry_present(menu_path: str) -> bool:
         return False
     if not path.is_file():
         raise ValueError("Omarchy menu extension path is not a regular file")
-    value = path.read_text(encoding="utf-8")
+    value = read_limited_text(path, MAX_MENU_EXTENSION_BYTES, "Omarchy menu extension")
     has_begin = MENU_MARKER_BEGIN in value
     has_end = MENU_MARKER_END in value
     if has_begin != has_end:
@@ -427,18 +579,21 @@ def menu_entry_operation(
 def plugin_enabled_state(plugin_id: str) -> bool | None:
     """Return None when the shell cannot answer, so shutdown never removes config."""
     try:
-        process = subprocess.run(
+        process = run_bounded_process(
             ["omarchy", "plugin", "list", "--json"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            output_limit=MAX_PLUGIN_LIST_OUTPUT,
             timeout=5,
-            check=False,
-            text=True,
         )
         if process.returncode != 0:
             return None
-        plugins = json.loads(process.stdout)
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        plugins = json.loads(process.stdout.decode("utf-8"))
+    except (
+        OSError,
+        UnicodeDecodeError,
+        BoundedOutputError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+    ):
         return None
     if not isinstance(plugins, list):
         return None
@@ -473,16 +628,19 @@ def default_browser_desktop() -> str:
         ["xdg-mime", "query", "default", "x-scheme-handler/https"],
     ):
         try:
-            result = subprocess.run(
+            process = run_bounded_process(
                 command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                output_limit=MAX_DEFAULT_BROWSER_OUTPUT,
                 timeout=2,
-                check=False,
                 env=environment,
-                text=True,
-            ).stdout.strip()
-        except (OSError, subprocess.TimeoutExpired):
+            )
+            result = process.stdout.decode("utf-8").strip()
+        except (
+            OSError,
+            UnicodeDecodeError,
+            BoundedOutputError,
+            subprocess.TimeoutExpired,
+        ):
             continue
         if result:
             identifier = Path(result).name
@@ -814,7 +972,7 @@ def png_data_url(raw: bytes) -> str:
         return ""
     coder, _, _ = source
     try:
-        proc = subprocess.run(
+        proc = run_bounded_process(
             [
                 "magick",
                 "-limit", "width", str(MAX_ICON_DIMENSION),
@@ -824,11 +982,9 @@ def png_data_url(raw: bytes) -> str:
                 f"{coder}:-[0]",
                 "-strip", "-thumbnail", "64x64>", "PNG:-",
             ],
-            input=raw,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            input_data=raw,
+            output_limit=MAX_ICON_OUTPUT,
             timeout=5,
-            check=False,
             env={
                 **os.environ,
                 "MAGICK_AREA_LIMIT": str(MAX_ICON_PIXELS),
@@ -841,20 +997,23 @@ def png_data_url(raw: bytes) -> str:
                 "MAGICK_WIDTH_LIMIT": str(MAX_ICON_DIMENSION),
             },
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, BoundedOutputError, subprocess.TimeoutExpired):
         return ""
     output = proc.stdout
-    if proc.returncode or not output.startswith(b"\x89PNG\r\n\x1a\n") or len(output) > MAX_ICON_OUTPUT:
+    if proc.returncode or not output.startswith(b"\x89PNG\r\n\x1a\n"):
         return ""
     return "data:image/png;base64," + base64.b64encode(output).decode("ascii")
 
 
 def embedded_icon(value: Any) -> str:
     value = str(value or "").strip()
+    encoded_limit = ((MAX_ICON_INPUT + 2) // 3) * 4 + 4
+    if len(value) > encoded_limit + 256:
+        return ""
     match = re.fullmatch(r"data:image/[^;,]+(?:;[^,]*)?;base64,(.+)", value, re.I | re.S)
     if not match:
         return ""
-    if len(match.group(1)) > ((MAX_ICON_INPUT + 2) // 3) * 4 + 4:
+    if len(match.group(1)) > encoded_limit:
         return ""
     try:
         raw = base64.b64decode(match.group(1), validate=True)
@@ -1510,22 +1669,20 @@ def enrich_url_from_web(url: str) -> dict[str, Any]:
 def _run_web_enrichment(url: str, settings_path: str) -> tuple[str, str]:
     """Run all optional network and decoder work behind a hard wall-clock limit."""
     try:
-        process = subprocess.run(
+        process = run_bounded_process(
             [
                 sys.executable,
                 str(Path(__file__).resolve()),
                 "enrich-url",
                 settings_path,
             ],
-            input=url.encode("utf-8"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            input_data=url.encode("utf-8"),
+            output_limit=MAX_ENRICHMENT_OUTPUT,
             timeout=MAX_ENRICHMENT_SECONDS,
-            check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, BoundedOutputError, subprocess.TimeoutExpired):
         return "", ""
-    if process.returncode != 0 or len(process.stdout) > MAX_ENRICHMENT_OUTPUT:
+    if process.returncode != 0:
         return "", ""
     try:
         result = json.loads(process.stdout)
@@ -1545,13 +1702,14 @@ def clipboard_bookmark(
     settings_path: str = "",
 ) -> dict[str, Any]:
     try:
-        clipboard = subprocess.run(
+        process = run_bounded_process(
             ["wl-paste", "--no-newline", "--type", "text"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            output_limit=MAX_CLIPBOARD_BYTES,
             timeout=2,
-            check=False,
-        ).stdout.decode("utf-8", errors="replace").strip()
+        )
+        clipboard = process.stdout.decode("utf-8", errors="replace").strip()
+    except BoundedOutputError:
+        return {"ok": False, "error": "Clipboard text is too large"}
     except (OSError, subprocess.TimeoutExpired):
         return {"ok": False, "error": "Could not read the clipboard"}
 
@@ -1607,6 +1765,11 @@ def copy_url_to_clipboard(value: str) -> dict[str, Any]:
 
 
 def main() -> int:
+    # Quickshell terminates helpers when a transient dialog closes. Raising
+    # SystemExit lets active bounded subprocesses run their cleanup blocks and
+    # terminate their entire process groups instead of leaving descendants.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+    signal.signal(signal.SIGINT, lambda signum, frame: sys.exit(128 + signum))
     try:
         action = sys.argv[1]
         if action == "import" and len(sys.argv) == 4:

@@ -30,10 +30,18 @@ Item {
   property bool menuPromptCheckedForOpen: false
   property string menuEntryDecision: "pending"
   property string menuEntryOperation: ""
+  property bool menuStatusPending: false
   property bool networkEnrichmentEnabled: false
   property bool networkSettingStateReady: false
   property bool networkDialogOpen: false
   property string networkSettingOperation: ""
+  property var quickAddResult: null
+  property string quickAddResponseError: ""
+  property var copyResponse: null
+  property var menuStatusResponse: null
+  property var menuEntryResponse: null
+  property var networkSettingResponse: null
+  property string importPickerPath: ""
 
   readonly property string helperPath:
     root.localPath("bookmark_helper.py")
@@ -49,25 +57,36 @@ Item {
       ? String(manifest.id)
       : "stefanmara.bookmarks"
 
-  readonly property var keywordAction: root.resolveKeywordAction(root.query)
+  readonly property int maxQuickAddOutputCharacters: 512 * 1024
+
+  readonly property var keywordAction:
+    root.opened && root.viewMode === 0
+      ? root.resolveKeywordAction(root.query)
+      : null
 
   readonly property var filteredBookmarks:
-    root.bookmarksForQuery(root.query)
+    root.opened && root.viewMode === 0
+      ? root.bookmarksForQuery(root.query)
+      : []
 
   readonly property var allTags:
-    root.collectTags()
+    root.opened && root.viewMode === 1 ? root.collectTags() : []
 
   readonly property var filteredTags:
-    root.tagsForQuery(root.tagQuery)
+    root.opened && root.viewMode === 1 ? root.tagsForQuery(root.tagQuery) : []
 
   readonly property var allKeywords:
-    root.collectKeywords()
+    root.opened && root.viewMode === 2 ? root.collectKeywords() : []
 
   readonly property var filteredKeywords:
-    root.keywordsForQuery(root.keywordQuery)
+    root.opened && root.viewMode === 2
+      ? root.keywordsForQuery(root.keywordQuery)
+      : []
 
   readonly property var activeResults:
-    root.viewMode === 1
+    !root.opened
+      ? []
+      : root.viewMode === 1
       ? root.filteredTags
       : root.viewMode === 2
         ? root.filteredKeywords
@@ -92,6 +111,13 @@ Item {
     return value.indexOf("file://") === 0
       ? decodeURIComponent(value.substring(7))
       : value
+  }
+
+  function parseSmallHelperResponse(data) {
+    var output = String(data || "")
+    if (output.length > 64 * 1024)
+      throw new Error("Helper returned too much data")
+    return JSON.parse(output)
   }
 
   function resolveKeywordAction(value) {
@@ -456,7 +482,7 @@ Item {
     root.deleteTarget = null
     root.fileDialogOpen = false
     root.statusMessage = ""
-    root.quickAddCanceled = false
+    root.quickAddCanceled = quickAddProcess.running
     root.browserTarget = null
     root.copyTargetTitle = ""
     root.menuEntryDialogOpen = false
@@ -472,14 +498,18 @@ Item {
   }
 
   function close() {
+    statusTimer.stop()
     if (importPickerProcess.running)
       importPickerProcess.running = false
     root.fileDialogOpen = false
     if (quickAddProcess.running) {
       root.quickAddCanceled = true
       quickAddProcess.running = false
+    } else {
+      root.quickAdding = false
     }
-    root.quickAdding = false
+    root.quickAddResult = null
+    root.quickAddResponseError = ""
     root.opened = false
     root.query = ""
     root.viewMode = 0
@@ -742,6 +772,7 @@ Item {
   function refreshMenuEntryStatus() {
     if (!store.storageReady || menuStatusProcess.running)
       return
+    root.menuStatusPending = true
     menuStatusProcess.command = [
       "python3", root.helperPath,
       "menu-entry", "status",
@@ -901,24 +932,39 @@ Item {
     running: false
     command: ["true"]
 
-    stdout: StdioCollector {
-      id: quickAddOutput
-      waitForEnd: true
+    onStarted: {
+      root.quickAddResult = null
+      root.quickAddResponseError = ""
     }
 
-    stderr: StdioCollector {
-      id: quickAddError
-      waitForEnd: true
+    stdout: SplitParser {
+      onRead: function(data) {
+        try {
+          var output = String(data || "")
+          if (output.length > root.maxQuickAddOutputCharacters)
+            throw new Error("Clipboard helper returned too much data")
+          root.quickAddResult = JSON.parse(output)
+        } catch (exception) {
+          root.quickAddResponseError = String(
+            exception.message || "Could not add clipboard bookmark"
+          )
+        }
+      }
     }
 
     onExited: function(exitCode) {
       root.quickAdding = false
       if (root.quickAddCanceled) {
         root.quickAddCanceled = false
+        root.quickAddResult = null
+        root.quickAddResponseError = ""
         return
       }
-      try {
-        var result = JSON.parse(String(quickAddOutput.text || ""))
+      var result = root.quickAddResult
+      var responseError = root.quickAddResponseError
+      root.quickAddResult = null
+      root.quickAddResponseError = ""
+      if (result) {
         if (exitCode !== 0 || !result.ok) {
           root.showStatus(String(result.error || "Could not add clipboard bookmark"))
         } else if (result.duplicate) {
@@ -929,10 +975,24 @@ Item {
         } else {
           editor.openForClipboard(result.item)
         }
-      } catch (exception) {
-        root.showStatus(String(quickAddError.text || "Could not add clipboard bookmark").trim())
+      } else {
+        root.showStatus(responseError || "Could not add clipboard bookmark")
       }
       root.refocusList()
+    }
+
+    onRunningChanged: {
+      if (!running && root.quickAdding) {
+        var canceled = root.quickAddCanceled
+        root.quickAdding = false
+        root.quickAddCanceled = false
+        root.quickAddResult = null
+        root.quickAddResponseError = ""
+        if (!canceled && root.opened) {
+          root.showStatus("Could not start the clipboard helper")
+          root.refocusList()
+        }
+      }
     }
   }
 
@@ -941,23 +1001,40 @@ Item {
     running: false
     command: ["true"]
 
-    stdout: StdioCollector {
-      id: copyOutput
-      waitForEnd: true
+    onStarted: root.copyResponse = null
+
+    stdout: SplitParser {
+      onRead: function(data) {
+        try {
+          root.copyResponse = root.parseSmallHelperResponse(data)
+        } catch (exception) {
+          root.copyResponse = {ok: false, error: "Could not copy URL"}
+        }
+      }
     }
 
     onExited: function(exitCode) {
       var message = "Copied " + root.copyTargetTitle + " URL"
-      try {
-        var result = JSON.parse(String(copyOutput.text || ""))
-        if (exitCode !== 0 || !result.ok)
-          message = String(result.error || "Could not copy URL")
-      } catch (exception) {
-        message = "Could not copy URL"
-      }
+      var result = root.copyResponse
+      root.copyResponse = null
+      if (!result || exitCode !== 0 || !result.ok)
+        message = String(result && result.error || "Could not copy URL")
       root.copyTargetTitle = ""
-      root.showStatus(message)
-      root.refocusList()
+      if (root.opened) {
+        root.showStatus(message)
+        root.refocusList()
+      }
+    }
+
+    onRunningChanged: {
+      if (!running && root.copyTargetTitle) {
+        root.copyResponse = null
+        root.copyTargetTitle = ""
+        if (root.opened) {
+          root.showStatus("Could not start the clipboard helper")
+          root.refocusList()
+        }
+      }
     }
   }
 
@@ -966,14 +1043,28 @@ Item {
     running: false
     command: ["true"]
 
-    stdout: StdioCollector {
-      id: menuStatusOutput
-      waitForEnd: true
+    onStarted: root.menuStatusResponse = null
+
+    stdout: SplitParser {
+      onRead: function(data) {
+        try {
+          root.menuStatusResponse = root.parseSmallHelperResponse(data)
+        } catch (exception) {
+          root.menuStatusResponse = {
+            ok: false,
+            error: "Could not inspect main-menu entry"
+          }
+        }
+      }
     }
 
     onExited: function(exitCode) {
+      root.menuStatusPending = false
       try {
-        var result = JSON.parse(String(menuStatusOutput.text || ""))
+        var result = root.menuStatusResponse
+        root.menuStatusResponse = null
+        if (!result)
+          throw new Error("Could not inspect main-menu entry")
         if (exitCode !== 0 || !result.ok)
           throw new Error(String(result.error || "Could not inspect main-menu entry"))
         root.menuEntryInstalled = Boolean(result.installed)
@@ -986,7 +1077,22 @@ Item {
         root.menuEntryStateReady = false
         root.networkEnrichmentEnabled = false
         root.networkSettingStateReady = false
-        root.showStatus(String(exception.message || "Could not inspect main-menu entry"))
+        if (root.opened) {
+          root.showStatus(
+            String(exception.message || "Could not inspect main-menu entry")
+          )
+        }
+      }
+    }
+
+    onRunningChanged: {
+      if (!running && root.menuStatusPending) {
+        root.menuStatusResponse = null
+        root.menuStatusPending = false
+        root.menuEntryStateReady = false
+        root.networkSettingStateReady = false
+        if (root.opened)
+          root.showStatus("Could not start the settings helper")
       }
     }
   }
@@ -996,30 +1102,54 @@ Item {
     running: false
     command: ["true"]
 
-    stdout: StdioCollector {
-      id: menuEntryOutput
-      waitForEnd: true
+    onStarted: root.menuEntryResponse = null
+
+    stdout: SplitParser {
+      onRead: function(data) {
+        try {
+          root.menuEntryResponse = root.parseSmallHelperResponse(data)
+        } catch (exception) {
+          root.menuEntryResponse = {
+            ok: false,
+            error: "Could not update main-menu entry"
+          }
+        }
+      }
     }
 
     onExited: function(exitCode) {
       try {
-        var result = JSON.parse(String(menuEntryOutput.text || ""))
+        var result = root.menuEntryResponse
+        root.menuEntryResponse = null
+        if (!result)
+          throw new Error("Could not update main-menu entry")
         if (exitCode !== 0 || !result.ok)
           throw new Error(String(result.error || "Could not update main-menu entry"))
         root.menuEntryInstalled = Boolean(result.installed)
         root.menuEntryDecision = String(result.decision || "dismissed")
         root.menuEntryDialogOpen = false
-        if (root.menuEntryOperation === "install")
-          root.showStatus("Added Bookmarks to the main Omarchy menu")
-        else if (root.menuEntryOperation === "remove")
-          root.showStatus("Removed Bookmarks from the main Omarchy menu")
+        if (root.opened) {
+          if (root.menuEntryOperation === "install")
+            root.showStatus("Added Bookmarks to the main Omarchy menu")
+          else if (root.menuEntryOperation === "remove")
+            root.showStatus("Removed Bookmarks from the main Omarchy menu")
+        }
       } catch (exception) {
         menuEntryDialog.errorMessage = String(
           exception.message || "Could not update main-menu entry"
         )
       }
       root.menuEntryOperation = ""
-      root.refocusList()
+      if (root.opened)
+        root.refocusList()
+    }
+
+    onRunningChanged: {
+      if (!running && root.menuEntryOperation) {
+        root.menuEntryResponse = null
+        root.menuEntryOperation = ""
+        menuEntryDialog.errorMessage = "Could not start the settings helper"
+      }
     }
   }
 
@@ -1028,34 +1158,57 @@ Item {
     running: false
     command: ["true"]
 
-    stdout: StdioCollector {
-      id: networkSettingOutput
-      waitForEnd: true
+    onStarted: root.networkSettingResponse = null
+
+    stdout: SplitParser {
+      onRead: function(data) {
+        try {
+          root.networkSettingResponse = root.parseSmallHelperResponse(data)
+        } catch (exception) {
+          root.networkSettingResponse = {
+            ok: false,
+            error: "Could not save web-details preference"
+          }
+        }
+      }
     }
 
     onExited: function(exitCode) {
       try {
-        var result = JSON.parse(String(networkSettingOutput.text || ""))
+        var result = root.networkSettingResponse
+        root.networkSettingResponse = null
+        if (!result)
+          throw new Error("Could not save web-details preference")
         if (exitCode !== 0 || !result.ok)
           throw new Error(String(result.error || "Could not save web-details preference"))
         root.networkEnrichmentEnabled = result.enabled === true
         root.networkSettingStateReady = true
         root.networkDialogOpen = false
-        root.showStatus(
-          root.networkEnrichmentEnabled
-            ? "Web details enabled for future pasted URLs"
-            : "Web details disabled · pasting will not access the network"
-        )
-        if (editor.opened)
-          editor.refocus()
-        else
-          root.refocusList()
+        if (root.opened) {
+          root.showStatus(
+            root.networkEnrichmentEnabled
+              ? "Web details enabled for future pasted URLs"
+              : "Web details disabled · pasting will not access the network"
+          )
+          if (editor.opened)
+            editor.refocus()
+          else
+            root.refocusList()
+        }
       } catch (exception) {
         networkDialog.errorMessage = String(
           exception.message || "Could not save web-details preference"
         )
       }
       root.networkSettingOperation = ""
+    }
+
+    onRunningChanged: {
+      if (!running && root.networkSettingOperation) {
+        root.networkSettingResponse = null
+        root.networkSettingOperation = ""
+        networkDialog.errorMessage = "Could not start the settings helper"
+      }
     }
   }
 
@@ -1064,26 +1217,34 @@ Item {
     running: false
     command: ["true"]
 
-    stdout: StdioCollector {
-      id: importPickerOutput
-      waitForEnd: true
-    }
+    onStarted: root.importPickerPath = ""
 
-    stderr: StdioCollector {
-      id: importPickerError
-      waitForEnd: true
+    stdout: SplitParser {
+      onRead: function(data) {
+        var path = String(data || "").trim()
+        root.importPickerPath = path.length <= 4096 ? path : ""
+      }
     }
 
     onExited: function(exitCode) {
       root.fileDialogOpen = false
-      var path = String(importPickerOutput.text || "").trim()
+      var path = root.importPickerPath
+      root.importPickerPath = ""
       if (exitCode === 0 && path)
         importer.begin(path)
       else {
-        var message = String(importPickerError.text || "").trim()
-        if (message)
-          root.showStatus("Could not open import picker · install Zenity")
         root.refocusList()
+      }
+    }
+
+    onRunningChanged: {
+      if (!running && root.fileDialogOpen) {
+        root.importPickerPath = ""
+        root.fileDialogOpen = false
+        if (root.opened) {
+          root.showStatus("Could not open import picker · install Zenity")
+          root.refocusList()
+        }
       }
     }
   }
@@ -1475,6 +1636,7 @@ Item {
                   sourceSize.height: 64
                   fillMode: Image.PreserveAspectFit
                   asynchronous: true
+                  cache: false
                 }
 
                 Text {
@@ -1761,10 +1923,9 @@ Item {
         anchors.fill: parent
 
         opened: root.deleteConfirmOpen
-        message:
-          root.deleteTarget
-            ? "Delete “" + root.displayTitle(root.deleteTarget) + "”?"
-            : "Delete this bookmark?"
+        // ConfirmDialog renders its message with Text.AutoText. Keep this
+        // strictly static so imported or fetched fields never reach that sink.
+        message: "Delete the selected bookmark?"
 
         cancelText: "Cancel"
         confirmText: "Delete"

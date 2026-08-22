@@ -79,9 +79,16 @@ Item {
 
   function close() {
     root.opened = false
+    root.editing = false
+    root.fromClipboard = false
+    root.bookmarkId = ""
     root.validationError = ""
     root.initialUrl = ""
     root.pendingFavicon = ""
+    titleField.text = ""
+    urlField.text = ""
+    tagsField.text = ""
+    keywordField.text = ""
   }
 
   function refocus() {

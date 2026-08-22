@@ -6,6 +6,7 @@ ShellRoot {
   id: root
 
   property bool started: false
+  property int reloadStressCycles: 0
 
   function fail(message) {
     console.error("BOOKMARK_STORE_TEST_FAIL:", message)
@@ -191,12 +192,50 @@ ShellRoot {
         || !root.check(store.flushUsage(), "usage flush failed")) {
       return
     }
-    root.waitUntil(function() { return !store.saving }, root.passTests)
+    root.waitUntil(function() { return !store.saving }, root.startReloadStress)
+  }
+
+  function startReloadStress() {
+    if (!root.check(store.pendingUsageOpens === 0, "usage batch did not flush"))
+      return
+
+    var items = []
+    var title = "Resident reload ".concat("x".repeat(512))
+    for (var index = 0; index < 2000; index++) {
+      items.push({
+        id: "stress-" + index,
+        title: title,
+        url: "https://stress-" + index + ".example/path",
+        tags: ["stress"],
+        keyword: "",
+        favicon: "",
+        usageScore: 0,
+        lastOpenedAt: 0
+      })
+    }
+    if (!root.check(store.save(items, false), "could not prepare reload stress store"))
+      return
+    root.waitUntil(function() { return !store.saving }, root.runReloadStressCycle)
+  }
+
+  function runReloadStressCycle() {
+    if (root.reloadStressCycles >= 12) {
+      root.passTests()
+      return
+    }
+    store.reload()
+    root.waitUntil(
+      function() {
+        return !store.storeLoadAttemptActive && store.bookmarks.length === 2000
+      },
+      function() {
+        root.reloadStressCycles++
+        root.runReloadStressCycle()
+      }
+    )
   }
 
   function passTests() {
-    if (!root.check(store.pendingUsageOpens === 0, "usage batch did not flush"))
-      return
     console.log("BOOKMARK_STORE_TEST_PASS")
     Qt.quit()
   }
@@ -232,7 +271,7 @@ ShellRoot {
   }
 
   Timer {
-    interval: 15000
+    interval: 25000
     running: true
     onTriggered: root.fail("overall test timeout")
   }

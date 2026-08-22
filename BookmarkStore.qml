@@ -41,6 +41,15 @@ Item {
   property var saveQueue: []
   property var activeSave: null
   property int pendingUsageOpens: 0
+  property bool storeLoadResponseReceived: false
+  property bool reloadPending: false
+  property bool initializePending: false
+  property bool storeLoadAttemptActive: false
+  property bool storeSaveAttemptActive: false
+  property bool backupAttemptActive: false
+  property string initializeFailureDetail: ""
+  property var storeSaveResponse: null
+  property var backupResponse: null
 
   readonly property bool canMutate:
     root.storageReady
@@ -367,7 +376,6 @@ Item {
       result.push(item)
     }
     root.bookmarks = result
-    root.loaded = true
     root.persistenceBlocked = false
     if (invalid) {
       root.recoveryRequired = true
@@ -378,14 +386,15 @@ Item {
       root.recoveryRequired = false
       root.error = ""
     }
+    root.loaded = true
   }
 
   function failLoad(exception) {
     root.bookmarks = []
-    root.loaded = true
     root.recoveryRequired = true
     root.persistenceBlocked = false
     root.error = "Could not read bookmarks.json · writes are disabled to protect the file"
+    root.loaded = true
     console.warn("Bookmarks:", exception)
   }
 
@@ -405,12 +414,58 @@ Item {
   function reload() {
     if (!root.storageReady)
       return
+    if (storeLoadProcess.running) {
+      root.reloadPending = true
+      return
+    }
+    root.reloadPending = false
     storeLoadProcess.command = [
       "python3", root.localPath("bookmark_helper.py"),
       "store-load", root.dataPath
     ]
-    storeLoadProcess.running = false
+    root.storeLoadResponseReceived = false
+    root.storeLoadAttemptActive = true
     storeLoadProcess.running = true
+  }
+
+  function requestReload() {
+    reloadDebounce.restart()
+  }
+
+  function parseSmallHelperResponse(data) {
+    var output = String(data || "")
+    if (output.length > 64 * 1024)
+      throw new Error("Helper returned too much data")
+    return JSON.parse(output)
+  }
+
+  function handleStoreLoadResponse(data) {
+    root.storeLoadResponseReceived = true
+    usageSaveTimer.stop()
+    root.pendingUsageOpens = 0
+    try {
+      var output = String(data || "")
+      if (output.length > root.maxStoreResponseCharacters)
+        throw new Error("Bounded store reader returned too much data")
+      var result = JSON.parse(output)
+      if (!result.ok || !result.data)
+        throw new Error(String(result.error || "Could not read bookmarks.json"))
+      root.applyParsedData(result.data, result.invalid)
+    } catch (exception) {
+      root.failLoad(exception)
+    }
+  }
+
+  function finishStoreLoadAttempt() {
+    if (!root.storeLoadAttemptActive)
+      return
+    root.storeLoadAttemptActive = false
+    if (!root.storeLoadResponseReceived)
+      root.failLoad("Bounded store reader did not return a response")
+    if (root.reloadPending) {
+      root.reloadPending = false
+      reloadDebounce.restart()
+    }
   }
 
   function save(next, createBackup) {
@@ -462,6 +517,7 @@ Item {
         "python3", root.localPath("bookmark_helper.py"),
         "backup", root.dataPath
       ]
+      root.backupAttemptActive = true
       backupProcess.running = true
     } else {
       root.writeActiveSave()
@@ -476,7 +532,7 @@ Item {
       "python3", root.localPath("bookmark_helper.py"),
       "store-save", root.dataPath
     ]
-    storeSaveProcess.running = false
+    root.storeSaveAttemptActive = true
     storeSaveProcess.running = true
   }
 
@@ -660,28 +716,42 @@ Item {
       root.dataDir, root.dataPath
     ]
 
-    stdout: StdioCollector {
-      id: initializeOutput
-      waitForEnd: true
+    onStarted: root.initializeFailureDetail = ""
+
+    stdout: SplitParser {
+      onRead: function() {}
     }
 
-    stderr: StdioCollector {
-      id: initializeError
-      waitForEnd: true
+    stderr: SplitParser {
+      onRead: function(data) {
+        root.initializeFailureDetail = String(data || "").substring(0, 4096)
+      }
     }
 
     onExited: function(exitCode) {
+      root.initializePending = false
       if (exitCode !== 0) {
-        root.loaded = true
         root.recoveryRequired = true
-        root.error = String(
-          initializeError.text || "Could not initialize bookmark storage"
-        ).trim()
+        root.error = root.initializeFailureDetail
+          || "Could not initialize bookmark storage"
+        root.initializeFailureDetail = ""
+        root.loaded = true
         return
       }
 
+      root.initializeFailureDetail = ""
       root.storageReady = true
       Qt.callLater(root.reload)
+    }
+
+    onRunningChanged: {
+      if (!running && root.initializePending) {
+        root.initializePending = false
+        root.initializeFailureDetail = ""
+        root.recoveryRequired = true
+        root.error = "Could not start bookmark storage initialization"
+        root.loaded = true
+      }
     }
   }
 
@@ -690,34 +760,19 @@ Item {
     running: false
     command: ["true"]
 
-    stdout: StdioCollector {
-      id: storeLoadOutput
-      waitForEnd: true
-    }
+    onStarted: root.storeLoadResponseReceived = false
 
-    stderr: StdioCollector {
-      id: storeLoadError
-      waitForEnd: true
-    }
-
-    onExited: function(exitCode) {
-      usageSaveTimer.stop()
-      root.pendingUsageOpens = 0
-      try {
-        var output = String(storeLoadOutput.text || "")
-        if (output.length > root.maxStoreResponseCharacters)
-          throw new Error("Bounded store reader returned too much data")
-        var result = JSON.parse(output)
-        if (exitCode !== 0 || !result.ok || !result.data)
-          throw new Error(String(result.error || "Could not read bookmarks.json"))
-        root.applyParsedData(result.data, result.invalid)
-      } catch (exception) {
-        root.failLoad(
-          storeLoadError.text
-            ? String(storeLoadError.text).trim()
-            : exception
-        )
+    stdout: SplitParser {
+      onRead: function(data) {
+        root.handleStoreLoadResponse(data)
       }
+    }
+
+    onExited: root.finishStoreLoadAttempt()
+
+    onRunningChanged: {
+      if (!running)
+        root.finishStoreLoadAttempt()
     }
   }
 
@@ -727,42 +782,53 @@ Item {
     command: ["true"]
     stdinEnabled: true
 
-    stdout: StdioCollector {
-      id: storeSaveOutput
-      waitForEnd: true
-    }
-
-    stderr: StdioCollector {
-      id: storeSaveError
-      waitForEnd: true
+    stdout: SplitParser {
+      onRead: function(data) {
+        try {
+          root.storeSaveResponse = root.parseSmallHelperResponse(data)
+        } catch (exception) {
+          root.storeSaveResponse = {ok: false, error: "Invalid writer response"}
+        }
+      }
     }
 
     onStarted: {
+      root.storeSaveResponse = null
       if (root.activeSave !== null)
         write(root.activeSave.contents)
       stdinEnabled = false
     }
 
     onExited: function(exitCode) {
+      root.storeSaveAttemptActive = false
       var message = "Could not save bookmarks.json · writes are disabled"
-      try {
-        var result = JSON.parse(String(storeSaveOutput.text || ""))
-        if (exitCode !== 0 || !result.ok) {
-          if (result.error)
-            message += " · " + result.error
-          root.finishActiveSave(false, message)
-          return
-        }
-        root.finishActiveSave(true, "")
-      } catch (exception) {
-        if (storeSaveError.text)
-          message += " · " + String(storeSaveError.text).trim()
+      var result = root.storeSaveResponse
+      root.storeSaveResponse = null
+      if (!result || exitCode !== 0 || !result.ok) {
+        if (result && result.error)
+          message += " · " + result.error
         root.finishActiveSave(false, message)
+        return
+      }
+      root.finishActiveSave(true, "")
+    }
+
+    onRunningChanged: {
+      if (!running && root.storeSaveAttemptActive) {
+        root.storeSaveAttemptActive = false
+        root.storeSaveResponse = null
+        root.finishActiveSave(
+          false,
+          "Could not start the bookmark storage writer · writes are disabled"
+        )
       }
     }
   }
 
-  Component.onCompleted: initializeProcess.running = true
+  Component.onCompleted: {
+    root.initializePending = true
+    initializeProcess.running = true
+  }
 
   Component.onDestruction: Quickshell.execDetached([
     "python3", root.localPath("bookmark_helper.py"),
@@ -776,28 +842,52 @@ Item {
     onTriggered: root.flushUsage()
   }
 
+  Timer {
+    id: reloadDebounce
+    interval: 100
+    repeat: false
+    onTriggered: root.reload()
+  }
+
   Process {
     id: backupProcess
     running: false
     command: ["true"]
 
-    stdout: StdioCollector {
-      id: backupOutput
-      waitForEnd: true
+    onStarted: root.backupResponse = null
+
+    stdout: SplitParser {
+      onRead: function(data) {
+        try {
+          root.backupResponse = root.parseSmallHelperResponse(data)
+        } catch (exception) {
+          root.backupResponse = {ok: false, error: "Invalid backup response"}
+        }
+      }
     }
 
     onExited: function(exitCode) {
+      root.backupAttemptActive = false
+      var result = root.backupResponse
+      root.backupResponse = null
       if (exitCode !== 0) {
         var message = "Could not create an import backup · no changes were written"
-        try {
-          var result = JSON.parse(String(backupOutput.text || ""))
-          if (result.error)
-            message += " · " + result.error
-        } catch (exception) {
-        }
+        if (result && result.error)
+          message += " · " + result.error
         root.finishActiveSave(false, message)
       } else {
         root.writeActiveSave()
+      }
+    }
+
+    onRunningChanged: {
+      if (!running && root.backupAttemptActive) {
+        root.backupAttemptActive = false
+        root.backupResponse = null
+        root.finishActiveSave(
+          false,
+          "Could not start the import backup helper · no changes were written"
+        )
       }
     }
   }
@@ -810,7 +900,7 @@ Item {
     printErrors: false
     onFileChanged: {
       if (!root.saving && !root.pendingUsageOpens)
-        root.reload()
+        root.requestReload()
     }
   }
 }

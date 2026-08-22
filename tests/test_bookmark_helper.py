@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -25,6 +26,74 @@ def png_header(width=32, height=32):
         + int(height).to_bytes(4, "big")
         + b"\x08\x06\x00\x00\x00"
     )
+
+
+class BoundedProcessTests(unittest.TestCase):
+    def test_captures_only_within_the_declared_budget(self):
+        result = bookmark_helper.run_bounded_process(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())",
+            ],
+            input_data=b"bounded",
+            output_limit=7,
+            timeout=2,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"bounded")
+
+    def test_terminates_a_child_as_soon_as_output_exceeds_the_budget(self):
+        with self.assertRaises(bookmark_helper.BoundedOutputError):
+            bookmark_helper.run_bounded_process(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.buffer.write(b'x' * 4097)",
+                ],
+                output_limit=4096,
+                timeout=2,
+            )
+
+    def test_terminates_a_child_at_the_wall_clock_deadline(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            bookmark_helper.run_bounded_process(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                output_limit=16,
+                timeout=0.05,
+            )
+
+    def test_timeout_terminates_the_child_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "descendant.pid"
+            script = (
+                "import pathlib, subprocess, sys, time; "
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(30)']); "
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+                "time.sleep(30)"
+            )
+            with self.assertRaises(subprocess.TimeoutExpired):
+                bookmark_helper.run_bounded_process(
+                    [sys.executable, "-c", script, str(pid_path)],
+                    output_limit=16,
+                    timeout=0.2,
+                )
+
+            descendant_pid = int(pid_path.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                stat_path = Path(f"/proc/{descendant_pid}/stat")
+                if not stat_path.exists():
+                    break
+                # A killed child can remain briefly as a zombie while init
+                # reaps it; it is no longer executing in that state.
+                if stat_path.read_text(encoding="utf-8").split()[2] in ("Z", "X"):
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("bounded process left a running descendant")
 
 
 class UrlTests(unittest.TestCase):
@@ -305,7 +374,7 @@ class SafeFetchTests(unittest.TestCase):
         "bookmark_helper._run_web_enrichment",
         return_value=("Example", "data:image/png;base64,AAAA"),
     )
-    @mock.patch("bookmark_helper.subprocess.run")
+    @mock.patch("bookmark_helper.run_bounded_process")
     def test_opted_in_clipboard_path_uses_worker_result(self, run, enrich):
         run.return_value = subprocess.CompletedProcess(
             [], 0, stdout=b"https://example.com/article"
@@ -323,7 +392,7 @@ class SafeFetchTests(unittest.TestCase):
         self.assertEqual(result["item"]["title"], "Example")
         self.assertEqual(result["item"]["favicon"], "data:image/png;base64,AAAA")
 
-    @mock.patch("bookmark_helper.subprocess.run")
+    @mock.patch("bookmark_helper.run_bounded_process")
     def test_web_enrichment_worker_has_a_hard_timeout(self, run):
         run.side_effect = subprocess.TimeoutExpired(["python"], 15)
 
@@ -336,7 +405,7 @@ class SafeFetchTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 15)
 
     @mock.patch("bookmark_helper.fetch_bytes")
-    @mock.patch("bookmark_helper.subprocess.run")
+    @mock.patch("bookmark_helper.run_bounded_process")
     def test_default_clipboard_path_never_uses_the_network(self, run, fetch):
         run.return_value = subprocess.CompletedProcess(
             [], 0, stdout=b"http://127.0.0.1/admin"
@@ -350,6 +419,22 @@ class SafeFetchTests(unittest.TestCase):
         self.assertEqual(result["item"]["title"], "")
         self.assertEqual(result["item"]["favicon"], "")
         fetch.assert_not_called()
+
+    @mock.patch("bookmark_helper._run_web_enrichment")
+    @mock.patch(
+        "bookmark_helper.run_bounded_process",
+        side_effect=bookmark_helper.BoundedOutputError("too large"),
+    )
+    def test_clipboard_output_is_bounded_before_url_validation(self, run, enrich):
+        result = bookmark_helper.clipboard_bookmark("/tmp/missing-store.json")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "Clipboard text is too large")
+        self.assertEqual(
+            run.call_args.kwargs["output_limit"],
+            bookmark_helper.MAX_CLIPBOARD_BYTES,
+        )
+        enrich.assert_not_called()
 
 
 class ImportTests(unittest.TestCase):
@@ -437,7 +522,7 @@ class ImportTests(unittest.TestCase):
         self.assertIsNotNone(item)
         self.assertEqual(item["favicon"], "data:image/png;base64," + encoded)
 
-    @mock.patch("bookmark_helper.subprocess.run")
+    @mock.patch("bookmark_helper.run_bounded_process")
     def test_rerasterizes_favicons_from_external_json(self, run):
         incoming = png_header(32, 32)
         rendered = png_header(16, 16)
@@ -556,7 +641,7 @@ class StoreLoadTests(unittest.TestCase):
 
 class ImageSecurityTests(unittest.TestCase):
     def test_rejects_unknown_and_oversized_images_before_imagemagick(self):
-        with mock.patch("bookmark_helper.subprocess.run") as run:
+        with mock.patch("bookmark_helper.run_bounded_process") as run:
             self.assertEqual(bookmark_helper.png_data_url(b"<svg></svg>"), "")
             self.assertEqual(
                 bookmark_helper.png_data_url(
@@ -566,7 +651,18 @@ class ImageSecurityTests(unittest.TestCase):
             )
         run.assert_not_called()
 
-    @mock.patch("bookmark_helper.subprocess.run")
+    def test_rejects_oversized_embedded_icon_before_regex_or_decoder_work(self):
+        value = "data:image/png;base64," + (
+            "A" * (bookmark_helper.MAX_ICON_INPUT * 2)
+        )
+        with mock.patch("bookmark_helper.re.fullmatch") as fullmatch, \
+                mock.patch("bookmark_helper.run_bounded_process") as run:
+            self.assertEqual(bookmark_helper.embedded_icon(value), "")
+
+        fullmatch.assert_not_called()
+        run.assert_not_called()
+
+    @mock.patch("bookmark_helper.run_bounded_process")
     def test_uses_an_explicit_coder_and_hard_decoder_limits(self, run):
         run.return_value = subprocess.CompletedProcess(
             [], 0, stdout=png_header(64, 64)
@@ -649,6 +745,23 @@ class MenuEntryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "too large"):
                     bookmark_helper.read_settings(str(settings_path))
 
+    def test_rejects_oversized_shared_menu_before_status_or_modification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            menu = Path(directory) / "omarchy-menu.jsonc"
+            settings = Path(directory) / "settings.json"
+            original = "{" + (" " * 32) + "}\n"
+            menu.write_text(original, encoding="utf-8")
+
+            with mock.patch.object(bookmark_helper, "MAX_MENU_EXTENSION_BYTES", 16):
+                with self.assertRaisesRegex(ValueError, "menu extension is too large"):
+                    bookmark_helper.menu_entry_operation(
+                        "status", str(menu), str(settings)
+                    )
+                with self.assertRaisesRegex(ValueError, "menu extension is too large"):
+                    bookmark_helper.manage_menu_entry(str(menu), False)
+
+            self.assertEqual(menu.read_text(encoding="utf-8"), original)
+
     def test_installs_idempotently_and_preserves_existing_jsonc(self):
         original = """{
   // Keep this user's comment and formatting.
@@ -683,6 +796,17 @@ class MenuEntryTests(unittest.TestCase):
                 json.loads(bookmark_helper._strip_omarchy_jsonc(path.read_text())),
                 {"personal": {"label": "Personal", "action": "open-personal"}},
             )
+
+    def test_refuses_to_create_an_oversized_shared_menu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            menu = Path(directory) / "omarchy-menu.jsonc"
+            menu.write_text("{}\n", encoding="utf-8")
+
+            with mock.patch.object(bookmark_helper, "MAX_MENU_EXTENSION_BYTES", 64):
+                with self.assertRaisesRegex(ValueError, "menu extension is too large"):
+                    bookmark_helper.manage_menu_entry(str(menu), True)
+
+            self.assertEqual(menu.read_text(encoding="utf-8"), "{}\n")
 
     def test_supports_items_wrapper_and_creates_missing_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -755,6 +879,8 @@ class MenuEntryTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "incomplete"):
                 bookmark_helper.menu_entry_present(str(menu))
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                bookmark_helper.manage_menu_entry(str(menu), False)
 
 
 class ClipboardCopyTests(unittest.TestCase):
@@ -941,6 +1067,16 @@ class QmlSecurityTests(unittest.TestCase):
         self.assertIn("Enable anyway", source)
         self.assertGreaterEqual(source.count("textFormat: Text.PlainText"), 3)
 
+    def test_shared_delete_confirmation_never_receives_untrusted_text(self):
+        source = (PROJECT_ROOT / "Bookmarks.qml").read_text(encoding="utf-8")
+        confirm = source[
+            source.index("ConfirmDialog {"):source.index("MenuEntryDialog {")
+        ]
+
+        self.assertIn('message: "Delete the selected bookmark?"', confirm)
+        self.assertNotIn("deleteTarget", confirm)
+        self.assertNotIn("displayTitle", confirm)
+
     def test_untrusted_text_sinks_are_plain_text(self):
         checks = {
             "Bookmarks.qml": (
@@ -967,6 +1103,108 @@ class QmlSecurityTests(unittest.TestCase):
                         "textFormat: Text.PlainText",
                         source[position:position + 1000],
                     )
+
+
+class QmlResidentLifecycleTests(unittest.TestCase):
+    def test_hidden_menu_releases_derived_models_and_favicon_cache(self):
+        source = (PROJECT_ROOT / "Bookmarks.qml").read_text(encoding="utf-8")
+
+        for expression in (
+            "root.opened && root.viewMode === 0",
+            "? root.resolveKeywordAction(root.query)",
+            "? root.bookmarksForQuery(root.query)",
+            "root.opened && root.viewMode === 1 ? root.collectTags() : []",
+            "root.opened && root.viewMode === 2 ? root.collectKeywords() : []",
+            "!root.opened\n      ? []",
+        ):
+            self.assertIn(expression, source)
+        favicon = source[source.index("id: faviconImage"):]
+        self.assertIn("cache: false", favicon[:1000])
+
+    def test_large_helper_responses_are_not_retained_by_collectors(self):
+        checks = {
+            "Bookmarks.qml": ("id: quickAddProcess", "id: copyProcess"),
+            "BookmarkStore.qml": ("id: storeLoadProcess", "id: storeSaveProcess"),
+            "BookmarkImport.qml": ("id: importProcess", "Rectangle {"),
+            "BrowserPicker.qml": ("id: browserProcess", "Rectangle {"),
+        }
+        for filename, (start, end) in checks.items():
+            source = (PROJECT_ROOT / filename).read_text(encoding="utf-8")
+            process = source[source.index(start):source.index(end, source.index(start))]
+            with self.subTest(filename=filename):
+                self.assertIn("SplitParser", process)
+                self.assertNotIn("StdioCollector", process)
+
+        for path in PROJECT_ROOT.glob("*.qml"):
+            with self.subTest(filename=path.name, parser="all"):
+                self.assertNotIn(
+                    "StdioCollector",
+                    path.read_text(encoding="utf-8"),
+                )
+
+    def test_transient_dialog_payloads_are_cleared_on_close(self):
+        checks = {
+            "BookmarkEditor.qml": (
+                'root.bookmarkId = ""',
+                'titleField.text = ""',
+                'urlField.text = ""',
+                'tagsField.text = ""',
+                'keywordField.text = ""',
+            ),
+            "BookmarkImport.qml": (
+                'root.sourcePath = ""',
+                "root.result = null",
+            ),
+            "BrowserPicker.qml": (
+                'root.bookmarkTitle = ""',
+                "root.browsers = []",
+            ),
+        }
+        for filename, needles in checks.items():
+            source = (PROJECT_ROOT / filename).read_text(encoding="utf-8")
+            close = source[source.index("function close()") : source.index("function ", source.index("function close()") + 1)]
+            for needle in needles:
+                with self.subTest(filename=filename, needle=needle):
+                    self.assertIn(needle, close)
+
+    def test_store_file_events_are_debounced_and_loads_are_coalesced(self):
+        source = (PROJECT_ROOT / "BookmarkStore.qml").read_text(encoding="utf-8")
+        reload_function = source[
+            source.index("function reload()") : source.index("function save(")
+        ]
+        watcher = source[source.index("FileView {") :]
+
+        self.assertIn("if (storeLoadProcess.running)", reload_function)
+        self.assertIn("root.reloadPending = true", reload_function)
+        self.assertNotIn("storeLoadProcess.running = false", reload_function)
+        self.assertIn("root.requestReload()", watcher)
+        self.assertIn("id: reloadDebounce", source)
+
+    def test_failed_process_starts_release_busy_state(self):
+        checks = {
+            "Bookmarks.qml": (
+                "root.quickAdding",
+                "root.copyTargetTitle",
+                "root.menuStatusPending",
+                "root.menuEntryOperation",
+                "root.networkSettingOperation",
+                "root.fileDialogOpen",
+            ),
+            "BookmarkStore.qml": (
+                "root.initializePending",
+                "root.storeLoadAttemptActive",
+                "root.storeSaveAttemptActive",
+                "root.backupAttemptActive",
+            ),
+            "BookmarkImport.qml": ("root.loading",),
+            "BrowserPicker.qml": ("root.loading",),
+        }
+        for filename, guards in checks.items():
+            source = (PROJECT_ROOT / filename).read_text(encoding="utf-8")
+            with self.subTest(filename=filename):
+                self.assertIn("onRunningChanged", source)
+                for guard in guards:
+                    self.assertIn(guard, source)
 
 
 if __name__ == "__main__":

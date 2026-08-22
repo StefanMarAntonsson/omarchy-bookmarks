@@ -13,6 +13,7 @@ Item {
   property string error: ""
   property var browsers: []
   property int selectedIndex: 0
+  property bool responseReceived: false
 
   readonly property int maxBrowserOutputCharacters: 2 * 1024 * 1024
   readonly property int maxBrowsers: 256
@@ -41,7 +42,45 @@ Item {
       browserProcess.running = false
     root.opened = false
     root.loading = false
+    root.bookmarkTitle = ""
     root.error = ""
+    root.browsers = []
+    root.selectedIndex = 0
+    root.responseReceived = false
+  }
+
+  function handleResponse(data) {
+    root.responseReceived = true
+    try {
+      var output = String(data || "")
+      if (output.length > root.maxBrowserOutputCharacters)
+        throw new Error("Browser discovery returned too much data")
+      var result = JSON.parse(output)
+      if (!result.ok)
+        throw new Error(String(result.error || "Could not find installed browsers"))
+      if (!Array.isArray(result.browsers)
+          || result.browsers.length > root.maxBrowsers) {
+        throw new Error("Browser discovery returned an invalid browser list")
+      }
+      var browsers = []
+      for (var index = 0; index < result.browsers.length; index++) {
+        var browser = root.normalizedBrowser(result.browsers[index])
+        if (!browser)
+          throw new Error("Browser discovery returned an invalid browser entry")
+        browsers.push(browser)
+      }
+      root.browsers = browsers
+      root.selectedIndex = 0
+      root.error = root.browsers.length
+        ? ""
+        : "No registered HTTPS browsers found"
+    } catch (exception) {
+      root.browsers = []
+      root.selectedIndex = 0
+      root.error = String(
+        exception.message || "Could not find installed browsers"
+      ).trim()
+    }
   }
 
   function cancel() {
@@ -129,48 +168,30 @@ Item {
     running: false
     command: ["true"]
 
-    stdout: StdioCollector {
-      id: browserOutput
-      waitForEnd: true
+    onStarted: root.responseReceived = false
+
+    stdout: SplitParser {
+      onRead: function(data) {
+        if (root.opened)
+          root.handleResponse(data)
+      }
     }
 
-    stderr: StdioCollector {
-      id: browserError
-      waitForEnd: true
-    }
-
-    onExited: function(exitCode) {
+    onExited: function() {
       if (!root.opened)
         return
       root.loading = false
-      try {
-        var output = String(browserOutput.text || "")
-        if (output.length > root.maxBrowserOutputCharacters)
-          throw new Error("Browser discovery returned too much data")
-        var result = JSON.parse(output)
-        if (exitCode !== 0 || !result.ok)
-          throw new Error(String(result.error || "Could not find installed browsers"))
-        if (!Array.isArray(result.browsers)
-            || result.browsers.length > root.maxBrowsers) {
-          throw new Error("Browser discovery returned an invalid browser list")
-        }
-        var browsers = []
-        for (var index = 0; index < result.browsers.length; index++) {
-          var browser = root.normalizedBrowser(result.browsers[index])
-          if (!browser)
-            throw new Error("Browser discovery returned an invalid browser entry")
-          browsers.push(browser)
-        }
-        root.browsers = browsers
-        root.selectedIndex = 0
-        if (!root.browsers.length)
-          root.error = "No registered HTTPS browsers found"
-      } catch (exception) {
-        root.error = String(
-          browserError.text || exception.message || "Could not find installed browsers"
-        ).trim()
-      }
+      if (!root.responseReceived)
+        root.error = "Could not find installed browsers"
       root.forceActiveFocus()
+    }
+
+    onRunningChanged: {
+      if (!running && root.loading) {
+        root.loading = false
+        root.error = "Could not start the browser discovery helper"
+        root.forceActiveFocus()
+      }
     }
   }
 

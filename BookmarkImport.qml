@@ -13,6 +13,7 @@ Item {
   property string sourcePath: ""
   property string error: ""
   property var result: null
+  property bool responseReceived: false
 
   readonly property int maxImportOutputCharacters: 128 * 1024 * 1024
   readonly property int maxBookmarks: 50000
@@ -37,6 +38,33 @@ Item {
       importProcess.running = false
     root.opened = false
     root.loading = false
+    root.sourcePath = ""
+    root.error = ""
+    root.result = null
+    root.responseReceived = false
+  }
+
+  function handleResponse(data) {
+    root.responseReceived = true
+    try {
+      var output = String(data || "")
+      if (output.length > root.maxImportOutputCharacters)
+        throw new Error("Bookmark import returned too much data")
+      var parsed = JSON.parse(output)
+      if (parsed.ok
+          && Array.isArray(parsed.items)
+          && parsed.items.length <= root.maxBookmarks) {
+        root.result = parsed
+        root.error = ""
+      } else {
+        root.error = String(parsed.error || "Could not read that bookmark file")
+      }
+    } catch (exception) {
+      root.result = null
+      root.error = String(
+        exception.message || "Could not read that bookmark file"
+      ).trim()
+    }
   }
 
   function cancel() {
@@ -73,38 +101,30 @@ Item {
     running: false
     command: ["true"]
 
-    stdout: StdioCollector {
-      id: importOutput
-      waitForEnd: true
+    onStarted: root.responseReceived = false
+
+    stdout: SplitParser {
+      onRead: function(data) {
+        if (root.opened)
+          root.handleResponse(data)
+      }
     }
 
-    stderr: StdioCollector {
-      id: importError
-      waitForEnd: true
-    }
-
-    onExited: function(exitCode) {
+    onExited: function() {
       if (!root.opened)
         return
       root.loading = false
-      try {
-        var output = String(importOutput.text || "")
-        if (output.length > root.maxImportOutputCharacters)
-          throw new Error("Bookmark import returned too much data")
-        var parsed = JSON.parse(output)
-        if (exitCode === 0
-            && parsed.ok
-            && Array.isArray(parsed.items)
-            && parsed.items.length <= root.maxBookmarks) {
-          root.result = parsed
-          root.error = ""
-        } else {
-          root.error = String(parsed.error || "Could not read that bookmark file")
-        }
-      } catch (exception) {
-        root.error = String(importError.text || "Could not read that bookmark file").trim()
-      }
+      if (!root.responseReceived)
+        root.error = "Could not read that bookmark file"
       root.forceActiveFocus()
+    }
+
+    onRunningChanged: {
+      if (!running && root.loading) {
+        root.loading = false
+        root.error = "Could not start the bookmark import helper"
+        root.forceActiveFocus()
+      }
     }
   }
 
