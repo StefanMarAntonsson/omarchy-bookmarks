@@ -27,12 +27,41 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 MAX_HTML = 1_000_000
 MAX_ICON_INPUT = 256_000
 MAX_ICON_OUTPUT = 96_000
+MAX_ICON_DIMENSION = 4096
+MAX_ICON_PIXELS = 4096 * 4096
+MAX_ICON_FRAMES = 16
+MAX_STORE_BYTES = 64 * 1024 * 1024
+MAX_IMPORT_BYTES = 50_000_000
+MAX_BOOKMARKS = 50_000
+MAX_IMPORT_ICONS = 512
+MAX_TITLE_LENGTH = 2048
+MAX_URL_LENGTH = 8192
+MAX_ID_LENGTH = 256
+MAX_TAGS = 64
+MAX_TAG_LENGTH = 128
+MAX_KEYWORD_LENGTH = 128
+MAX_DESKTOP_FILE_BYTES = 256 * 1024
+MAX_APPLICATION_ENTRIES = 10_000
+MAX_BROWSERS = 256
+MAX_BROWSER_NAME_LENGTH = 512
+MAX_BROWSER_ICON_LENGTH = 1024
+MAX_PATH_LENGTH = 4096
+MAX_ICON_CANDIDATES = 8
 BACKUP_LIMIT = 10
 USER_AGENT = "Omarchy Bookmarks/1.0"
 MENU_ENTRY_ID = "stefanmara-bookmarks"
 MENU_MARKER_BEGIN = "BEGIN stefanmara.bookmarks managed menu entry"
 MENU_MARKER_END = "END stefanmara.bookmarks managed menu entry"
 MENU_PREFERENCE_VERSION = 1
+
+
+def read_limited_text(path: Path, limit: int, description: str) -> str:
+    """Read a UTF-8 text file without ever buffering more than limit bytes."""
+    with path.open("rb") as stream:
+        raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError(f"{description} is too large")
+    return raw.decode("utf-8", errors="replace")
 
 
 def _strip_omarchy_jsonc(value: str) -> str:
@@ -405,7 +434,8 @@ def default_browser_desktop() -> str:
         except (OSError, subprocess.TimeoutExpired):
             continue
         if result:
-            return Path(result).name
+            identifier = Path(result).name
+            return identifier if len(identifier) <= MAX_ID_LENGTH else ""
     return ""
 
 
@@ -413,9 +443,10 @@ def desktop_browser(path: Path) -> dict[str, Any] | None:
     parser = configparser.ConfigParser(interpolation=None, strict=False)
     parser.optionxform = str
     try:
-        parser.read(path, encoding="utf-8")
+        raw = read_limited_text(path, MAX_DESKTOP_FILE_BYTES, "Desktop entry")
+        parser.read_string(raw, source=str(path))
         entry = parser["Desktop Entry"]
-    except (OSError, UnicodeError, configparser.Error, KeyError):
+    except (OSError, UnicodeError, ValueError, configparser.Error, KeyError):
         return None
     if entry.get("Type", "Application") != "Application":
         return None
@@ -432,13 +463,25 @@ def desktop_browser(path: Path) -> dict[str, Any] | None:
         if not executable or not os.access(executable, os.X_OK):
             return None
     name = entry.get("Name", "").strip()
-    if not name:
+    icon = entry.get("Icon", "").strip()
+    identifier = path.name
+    try:
+        desktop_path = str(path.resolve())
+    except (OSError, RuntimeError):
+        return None
+    if (
+        not name
+        or len(name) > MAX_BROWSER_NAME_LENGTH
+        or len(icon) > MAX_BROWSER_ICON_LENGTH
+        or len(identifier) > MAX_ID_LENGTH
+        or len(desktop_path) > MAX_PATH_LENGTH
+    ):
         return None
     return {
-        "id": path.name,
+        "id": identifier,
         "name": name,
-        "icon": entry.get("Icon", "").strip(),
-        "desktopPath": str(path.resolve()),
+        "icon": icon,
+        "desktopPath": desktop_path,
     }
 
 
@@ -447,21 +490,48 @@ def discover_browsers(
     default_desktop: str | None = None,
 ) -> dict[str, Any]:
     directories = application_dirs if application_dirs is not None else xdg_application_dirs()
-    default_id = default_browser_desktop() if default_desktop is None else Path(default_desktop).name
+    default_id = (
+        default_browser_desktop()
+        if default_desktop is None
+        else Path(default_desktop).name
+    )
+    if len(default_id) > MAX_ID_LENGTH:
+        default_id = ""
     browsers: list[dict[str, Any]] = []
     seen: set[str] = set()
+    scanned = 0
+    exhausted = False
     for directory in directories:
         if not directory.is_dir():
             continue
-        for path in sorted(directory.glob("*.desktop")):
-            if path.name in seen:
-                continue
-            seen.add(path.name)
-            browser = desktop_browser(path)
-            if browser is None:
-                continue
-            browser["isDefault"] = path.name == default_id
-            browsers.append(browser)
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    scanned += 1
+                    if scanned > MAX_APPLICATION_ENTRIES:
+                        exhausted = True
+                        break
+                    if not entry.name.endswith(".desktop") or entry.name in seen:
+                        continue
+                    seen.add(entry.name)
+                    try:
+                        if not entry.is_file(follow_symlinks=True):
+                            continue
+                    except OSError:
+                        continue
+                    path = Path(entry.path)
+                    browser = desktop_browser(path)
+                    if browser is None:
+                        continue
+                    browser["isDefault"] = path.name == default_id
+                    browsers.append(browser)
+                    if len(browsers) >= MAX_BROWSERS:
+                        exhausted = True
+                        break
+        except OSError:
+            continue
+        if exhausted:
+            break
     browsers.sort(key=lambda item: (not item["isDefault"], item["name"].casefold(), item["id"]))
     return {"ok": True, "browsers": browsers, "defaultDesktop": default_id}
 
@@ -498,7 +568,7 @@ def valid_url(value: Any, add_scheme: bool = False) -> str:
     value = str(value or "").strip()
     if add_scheme and value and ":" not in value.split("/", 1)[0]:
         value = "https://" + value
-    if not value or re.search(r"\s", value):
+    if not value or len(value) > MAX_URL_LENGTH or re.search(r"\s", value):
         return ""
     try:
         parsed = urlsplit(value)
@@ -535,13 +605,19 @@ def canonical_url(value: Any) -> str:
 
 
 def normalize_tags(value: Any) -> list[str]:
-    source = value if isinstance(value, list) else str(value or "").split(",")
+    if isinstance(value, list):
+        source = value[:MAX_TAGS]
+    else:
+        serialized = str(value or "")
+        if len(serialized) > MAX_TAGS * (MAX_TAG_LENGTH + 1):
+            return []
+        source = serialized.split(",", MAX_TAGS)[:MAX_TAGS]
     result: list[str] = []
     seen: set[str] = set()
     for item in source:
         tag = str(item).strip()
         key = tag.casefold()
-        if tag and key not in seen:
+        if tag and len(tag) <= MAX_TAG_LENGTH and key not in seen:
             result.append(tag)
             seen.add(key)
     return result
@@ -549,7 +625,11 @@ def normalize_tags(value: Any) -> list[str]:
 
 def normalize_keyword(value: Any) -> str:
     keyword = str(value or "").strip()
-    return keyword if keyword and not re.search(r"\s", keyword) else ""
+    return (
+        keyword
+        if keyword and len(keyword) <= MAX_KEYWORD_LENGTH and not re.search(r"\s", keyword)
+        else ""
+    )
 
 
 def stored_png_data_url(value: Any) -> str:
@@ -563,17 +643,136 @@ def stored_png_data_url(value: Any) -> str:
         raw = base64.b64decode(match.group(1), validate=True)
     except (ValueError, TypeError):
         return ""
-    if not raw.startswith(b"\x89PNG\r\n\x1a\n") or len(raw) > MAX_ICON_OUTPUT:
+    source = image_input(raw)
+    if (
+        len(raw) > MAX_ICON_OUTPUT
+        or source is None
+        or source[0] != "PNG"
+    ):
         return ""
     return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+
+
+def jpeg_dimensions(raw: bytes) -> tuple[int, int] | None:
+    """Read JPEG SOF dimensions without invoking an image decoder."""
+    if not raw.startswith(b"\xff\xd8"):
+        return None
+    index = 2
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    while index < len(raw):
+        if raw[index] != 0xFF:
+            index += 1
+            continue
+        while index < len(raw) and raw[index] == 0xFF:
+            index += 1
+        if index >= len(raw):
+            return None
+        marker = raw[index]
+        index += 1
+        if marker == 0x00 or marker == 0xD8 or 0xD0 <= marker <= 0xD9:
+            continue
+        if index + 2 > len(raw):
+            return None
+        segment_length = int.from_bytes(raw[index:index + 2], "big")
+        if segment_length < 2 or index + segment_length > len(raw):
+            return None
+        if marker in sof_markers:
+            if segment_length < 7:
+                return None
+            height = int.from_bytes(raw[index + 3:index + 5], "big")
+            width = int.from_bytes(raw[index + 5:index + 7], "big")
+            return width, height
+        index += segment_length
+    return None
+
+
+def webp_dimensions(raw: bytes) -> tuple[int, int] | None:
+    if len(raw) < 30 or raw[:4] != b"RIFF" or raw[8:12] != b"WEBP":
+        return None
+    chunk = raw[12:16]
+    if chunk == b"VP8X":
+        width = 1 + int.from_bytes(raw[24:27], "little")
+        height = 1 + int.from_bytes(raw[27:30], "little")
+        return width, height
+    if chunk == b"VP8L" and raw[20] == 0x2F:
+        bits = int.from_bytes(raw[21:25], "little")
+        return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+    if chunk == b"VP8 " and raw[23:26] == b"\x9d\x01\x2a":
+        width = int.from_bytes(raw[26:28], "little") & 0x3FFF
+        height = int.from_bytes(raw[28:30], "little") & 0x3FFF
+        return width, height
+    return None
+
+
+def image_input(raw: bytes) -> tuple[str, int, int] | None:
+    """Return an allowlisted ImageMagick coder and header dimensions."""
+    result: tuple[str, int, int] | None = None
+    if (
+        len(raw) >= 24
+        and raw.startswith(b"\x89PNG\r\n\x1a\n")
+        and raw[12:16] == b"IHDR"
+    ):
+        result = (
+            "PNG",
+            int.from_bytes(raw[16:20], "big"),
+            int.from_bytes(raw[20:24], "big"),
+        )
+    elif len(raw) >= 10 and raw[:6] in (b"GIF87a", b"GIF89a"):
+        result = (
+            "GIF",
+            int.from_bytes(raw[6:8], "little"),
+            int.from_bytes(raw[8:10], "little"),
+        )
+    elif raw.startswith(b"\xff\xd8"):
+        dimensions = jpeg_dimensions(raw)
+        if dimensions:
+            result = ("JPEG", dimensions[0], dimensions[1])
+    elif len(raw) >= 6 and raw[:4] == b"\x00\x00\x01\x00":
+        count = int.from_bytes(raw[4:6], "little")
+        if 0 < count <= MAX_ICON_FRAMES and len(raw) >= 6 + count * 16:
+            widths = [raw[6 + index * 16] or 256 for index in range(count)]
+            heights = [raw[7 + index * 16] or 256 for index in range(count)]
+            result = ("ICO", max(widths), max(heights))
+    elif len(raw) >= 30 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        dimensions = webp_dimensions(raw)
+        if dimensions:
+            result = ("WEBP", dimensions[0], dimensions[1])
+
+    if result is None:
+        return None
+    _, width, height = result
+    if (
+        width <= 0
+        or height <= 0
+        or width > MAX_ICON_DIMENSION
+        or height > MAX_ICON_DIMENSION
+        or width * height > MAX_ICON_PIXELS
+    ):
+        return None
+    return result
 
 
 def png_data_url(raw: bytes) -> str:
     if not raw or len(raw) > MAX_ICON_INPUT:
         return ""
+    source = image_input(raw)
+    if source is None:
+        return ""
+    coder, _, _ = source
     try:
         proc = subprocess.run(
-            ["magick", "-", "-strip", "-thumbnail", "64x64>", "png:-"],
+            [
+                "magick",
+                "-limit", "width", str(MAX_ICON_DIMENSION),
+                "-limit", "height", str(MAX_ICON_DIMENSION),
+                "-limit", "area", str(MAX_ICON_PIXELS),
+                "-limit", "list-length", str(MAX_ICON_FRAMES),
+                f"{coder}:-[0]",
+                "-strip", "-thumbnail", "64x64>", "PNG:-",
+            ],
             input=raw,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -581,11 +780,14 @@ def png_data_url(raw: bytes) -> str:
             check=False,
             env={
                 **os.environ,
-                "MAGICK_AREA_LIMIT": "64MP",
+                "MAGICK_AREA_LIMIT": str(MAX_ICON_PIXELS),
                 "MAGICK_DISK_LIMIT": "128MiB",
+                "MAGICK_HEIGHT_LIMIT": str(MAX_ICON_DIMENSION),
+                "MAGICK_LIST_LENGTH_LIMIT": str(MAX_ICON_FRAMES),
                 "MAGICK_MAP_LIMIT": "64MiB",
                 "MAGICK_MEMORY_LIMIT": "64MiB",
                 "MAGICK_TIME_LIMIT": "5",
+                "MAGICK_WIDTH_LIMIT": str(MAX_ICON_DIMENSION),
             },
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -600,6 +802,8 @@ def embedded_icon(value: Any) -> str:
     value = str(value or "").strip()
     match = re.fullmatch(r"data:image/[^;,]+(?:;[^,]*)?;base64,(.+)", value, re.I | re.S)
     if not match:
+        return ""
+    if len(match.group(1)) > ((MAX_ICON_INPUT + 2) // 3) * 4 + 4:
         return ""
     try:
         raw = base64.b64decode(match.group(1), validate=True)
@@ -627,19 +831,27 @@ class BookmarkHTMLParser(HTMLParser):
         self.items: list[dict[str, Any]] = []
         self._attrs: dict[str, str] | None = None
         self._title: list[str] = []
+        self._title_length = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() == "a":
             self._attrs = {str(k).upper(): str(v or "") for k, v in attrs}
             self._title = []
+            self._title_length = 0
 
     def handle_data(self, data: str) -> None:
         if self._attrs is not None:
-            self._title.append(data)
+            remaining = MAX_TITLE_LENGTH - self._title_length
+            if remaining > 0:
+                part = data[:remaining]
+                self._title.append(part)
+                self._title_length += len(part)
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() != "a" or self._attrs is None:
             return
+        if len(self.items) >= MAX_BOOKMARKS:
+            raise ValueError(f"Bookmark file contains more than {MAX_BOOKMARKS} entries")
         self.items.append({
             "title": html.unescape("".join(self._title)).strip(),
             "url": html.unescape(self._attrs.get("HREF", "")).strip(),
@@ -652,12 +864,66 @@ class BookmarkHTMLParser(HTMLParser):
 
 
 def read_store(path: str) -> list[dict[str, Any]]:
-    try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        source = data if isinstance(data, list) else data.get("bookmarks", [])
-        return source if isinstance(source, list) else []
-    except (OSError, ValueError, AttributeError):
+    store_path = Path(path)
+    if not store_path.exists():
         return []
+    raw = read_limited_text(store_path, MAX_STORE_BYTES, "Bookmarks store")
+    data = json.loads(raw)
+    if isinstance(data, list):
+        source = data
+    elif isinstance(data, dict) and isinstance(data.get("bookmarks"), list):
+        if int(data.get("version") or 0) > 3:
+            raise ValueError("bookmarks.json uses a newer data format")
+        source = data["bookmarks"]
+    else:
+        raise ValueError("bookmarks.json must contain a bookmarks array")
+    if len(source) > MAX_BOOKMARKS:
+        raise ValueError(f"Bookmarks store contains more than {MAX_BOOKMARKS} entries")
+    return source
+
+
+def load_store(path: str) -> dict[str, Any]:
+    """Return a byte- and count-bounded store document for the QML process."""
+    source = read_store(path)
+    bookmarks: list[dict[str, Any]] = []
+    invalid = 0
+    for raw_item in source:
+        item = normalize_item(raw_item, process_icon=False)
+        identifier = (
+            str(raw_item.get("id") or "").strip()
+            if isinstance(raw_item, dict)
+            else ""
+        )
+        if item is None or not identifier or len(identifier) > MAX_ID_LENGTH:
+            invalid += 1
+            continue
+        item["id"] = identifier
+        bookmarks.append(item)
+    return {
+        "ok": True,
+        "data": {"version": 3, "bookmarks": bookmarks},
+        "invalid": invalid,
+    }
+
+
+def save_store(path: str) -> dict[str, Any]:
+    """Atomically save one bounded store document received over stdin."""
+    raw = sys.stdin.buffer.read(MAX_STORE_BYTES + 1)
+    if len(raw) > MAX_STORE_BYTES:
+        raise ValueError("Bookmarks store is too large")
+    text = raw.decode("utf-8")
+    data = json.loads(text)
+    if not isinstance(data, dict) or not isinstance(data.get("bookmarks"), list):
+        raise ValueError("bookmarks.json must contain a bookmarks array")
+    if len(data["bookmarks"]) > MAX_BOOKMARKS:
+        raise ValueError(f"Bookmarks store contains more than {MAX_BOOKMARKS} entries")
+
+    destination = Path(path)
+    if destination.exists() and not destination.is_file():
+        raise ValueError("Bookmarks store path is not a regular file")
+    mode = destination.stat().st_mode & 0o777 if destination.exists() else 0o600
+    _atomic_write_text(destination, text, mode)
+    return {"ok": True}
 
 
 def normalize_item(item: Any, process_icon: bool = False) -> dict[str, Any] | None:
@@ -665,6 +931,9 @@ def normalize_item(item: Any, process_icon: bool = False) -> dict[str, Any] | No
         return None
     url = valid_url(item.get("url") or item.get("href"))
     if not url:
+        return None
+    title = str(item.get("title") or "").strip()
+    if len(title) > MAX_TITLE_LENGTH:
         return None
     favicon = (
         embedded_icon(item.get("iconSource"))
@@ -684,7 +953,7 @@ def normalize_item(item: Any, process_icon: bool = False) -> dict[str, Any] | No
     except (TypeError, ValueError, OverflowError):
         last_opened_at = 0
     return {
-        "title": str(item.get("title") or "").strip(),
+        "title": title,
         "url": url,
         "tags": normalize_tags(item.get("tags")),
         "keyword": normalize_keyword(item.get("keyword") or item.get("shortcuturl")),
@@ -699,10 +968,8 @@ def import_bookmarks(source_arg: str, store_path: str) -> dict[str, Any]:
         parsed = urlsplit(source_arg)
         source_arg = unquote(parsed.path)
     source_path = Path(source_arg)
-    if source_path.stat().st_size > 50_000_000:
-        raise ValueError("Bookmark file is too large")
     suffix = source_path.suffix.lower()
-    raw = source_path.read_text(encoding="utf-8", errors="replace")
+    raw = read_limited_text(source_path, MAX_IMPORT_BYTES, "Bookmark file")
 
     if suffix in (".html", ".htm") or "<!DOCTYPE NETSCAPE-Bookmark-file" in raw[:1000]:
         parser = BookmarkHTMLParser()
@@ -723,6 +990,9 @@ def import_bookmarks(source_arg: str, store_path: str) -> dict[str, Any]:
         source_format = "JSON"
         process_icons = False
 
+    if len(source_items) > MAX_BOOKMARKS:
+        raise ValueError(f"Bookmark file contains more than {MAX_BOOKMARKS} entries")
+
     existing = {canonical_url(item.get("url")): item for item in read_store(store_path)}
     result: list[dict[str, Any]] = []
     positions: dict[str, int] = {}
@@ -730,9 +1000,18 @@ def import_bookmarks(source_arg: str, store_path: str) -> dict[str, Any]:
     duplicates_in_file = 0
     duplicates_existing = 0
     icons = 0
+    processed_icons = 0
 
     for raw_item in source_items:
-        item = normalize_item(raw_item, process_icons)
+        should_process_icon = (
+            process_icons
+            and processed_icons < MAX_IMPORT_ICONS
+            and isinstance(raw_item, dict)
+            and bool(raw_item.get("iconSource"))
+        )
+        if should_process_icon:
+            processed_icons += 1
+        item = normalize_item(raw_item, should_process_icon)
         if item is None:
             rejected += 1
             continue
@@ -838,6 +1117,7 @@ class MetadataParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.in_title = False
         self.title_parts: list[str] = []
+        self.title_length = 0
         self.og_title = ""
         self.icons: list[str] = []
 
@@ -846,10 +1126,15 @@ class MetadataParser(HTMLParser):
         if tag.lower() == "title":
             self.in_title = True
         elif tag.lower() == "meta" and values.get("property", "").lower() == "og:title":
-            self.og_title = values.get("content", "").strip()
+            self.og_title = values.get("content", "").strip()[:MAX_TITLE_LENGTH]
         elif tag.lower() == "link" and "icon" in values.get("rel", "").lower().split():
-            if values.get("href"):
-                self.icons.append(values["href"])
+            href = values.get("href", "")
+            if (
+                href
+                and len(href) <= MAX_URL_LENGTH
+                and len(self.icons) < MAX_ICON_CANDIDATES
+            ):
+                self.icons.append(href)
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "title":
@@ -857,12 +1142,16 @@ class MetadataParser(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         if self.in_title:
-            self.title_parts.append(data)
+            remaining = MAX_TITLE_LENGTH - self.title_length
+            if remaining > 0:
+                part = data[:remaining]
+                self.title_parts.append(part)
+                self.title_length += len(part)
 
     @property
     def title(self) -> str:
         title = " ".join("".join(self.title_parts).split())
-        return title or self.og_title
+        return (title or self.og_title)[:MAX_TITLE_LENGTH]
 
 
 def clipboard_bookmark(store_path: str) -> dict[str, Any]:
@@ -951,6 +1240,10 @@ def main() -> int:
         action = sys.argv[1]
         if action == "import" and len(sys.argv) == 4:
             result = import_bookmarks(sys.argv[2], sys.argv[3])
+        elif action == "store-load" and len(sys.argv) == 3:
+            result = load_store(sys.argv[2])
+        elif action == "store-save" and len(sys.argv) == 3:
+            result = save_store(sys.argv[2])
         elif action == "clipboard" and len(sys.argv) == 3:
             result = clipboard_bookmark(sys.argv[2])
         elif action == "copy" and len(sys.argv) == 3:
@@ -973,10 +1266,11 @@ def main() -> int:
         else:
             raise ValueError(
                 "usage: bookmark_helper.py import FILE STORE | clipboard STORE | copy URL | "
-                "browsers | backup STORE | menu-entry {status|install|remove|dismiss} "
+                "store-load STORE | store-save STORE | browsers | backup STORE | "
+                "menu-entry {status|install|remove|dismiss} "
                 "FILE SETTINGS | menu-entry cleanup FILE"
             )
-    except (IndexError, OSError, ValueError, json.JSONDecodeError) as error:
+    except (IndexError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         result = {"ok": False, "error": str(error) or "Bookmark operation failed"}
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return 0 if result.get("ok") else 1

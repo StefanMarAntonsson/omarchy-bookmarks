@@ -1298,6 +1298,7 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
 
             text: root.currentQuery() || root.modePlaceholder()
+            textFormat: Text.PlainText
             color: Color.menu.text
             opacity: root.currentQuery() ? 1 : 0.58
 
@@ -1467,6 +1468,7 @@ Item {
                       : row.tagMode
                         ? "#" + row.modelData.tag
                         : row.modelData.keyword
+                  textFormat: Text.PlainText
 
                   color:
                     row.selected
@@ -1511,6 +1513,7 @@ Item {
                                 ? "  ·  " + row.bookmark.keyword
                                 : ""
                             )
+                  textFormat: Text.PlainText
 
                   color: Color.menu.text
                   opacity: 0.52
@@ -1577,6 +1580,7 @@ Item {
                       : root.viewMode === 2
                         ? "No keywords yet"
                         : "No bookmarks yet"
+              textFormat: Text.PlainText
 
               color: Color.menu.text
               opacity: 0.7
@@ -1606,6 +1610,7 @@ Item {
                     : root.viewMode === 2
                       ? "Enter Set  Ctrl+Enter Append  ↑↓ Select\nTab Bookmarks  Shift+Tab Tags"
                       : "Enter Open  Ctrl+C Copy  Ctrl+T Window  Ctrl+Tab Browser\nTab Tags  Ctrl+V Paste  Ctrl+I Import  Ctrl+N Add  Ctrl+E Edit  Delete"
+          textFormat: Text.PlainText
 
           color: store.error ? Color.urgent : Color.menu.text
           opacity: store.error ? 1 : 0.48

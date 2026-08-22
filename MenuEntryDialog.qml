@@ -112,6 +112,7 @@ Item {
           width: parent.width
           visible: root.busy || Boolean(root.errorMessage)
           text: root.errorMessage || "Updating main menu…"
+          textFormat: Text.PlainText
           color: root.errorMessage ? Color.urgent : root.foreground
           opacity: root.errorMessage ? 1 : 0.6
           font.family: root.fontFamily
@@ -163,6 +164,7 @@ Item {
                 Text {
                   anchors.centerIn: parent
                   text: modelData
+                  textFormat: Text.PlainText
                   color:
                     parent.destructive && parent.selected
                       ? Color.urgent

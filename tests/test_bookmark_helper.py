@@ -1,5 +1,6 @@
 import json
 import base64
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -13,6 +14,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import bookmark_helper
+
+
+def png_header(width=32, height=32):
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\rIHDR"
+        + int(width).to_bytes(4, "big")
+        + int(height).to_bytes(4, "big")
+        + b"\x08\x06\x00\x00\x00"
+    )
 
 
 class UrlTests(unittest.TestCase):
@@ -133,7 +144,7 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(process.stderr, "")
 
     def test_preserves_valid_plugin_png_without_imagemagick(self):
-        raw = b"\x89PNG\r\n\x1a\n" + b"test-payload"
+        raw = png_header()
         encoded = base64.b64encode(raw).decode("ascii")
         item = bookmark_helper.normalize_item({
             "url": "https://example.com",
@@ -142,6 +153,131 @@ class ImportTests(unittest.TestCase):
 
         self.assertIsNotNone(item)
         self.assertEqual(item["favicon"], "data:image/png;base64," + encoded)
+
+    def test_rejects_oversized_import_before_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "bookmarks.json"
+            source.write_text("{}" * 20, encoding="utf-8")
+            with mock.patch.object(bookmark_helper, "MAX_IMPORT_BYTES", 16):
+                with self.assertRaisesRegex(ValueError, "too large"):
+                    bookmark_helper.import_bookmarks(str(source), "missing-store.json")
+
+    def test_rejects_excessive_bookmark_count(self):
+        data = {"bookmarks": [
+            {"url": "https://one.example"},
+            {"url": "https://two.example"},
+        ]}
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "bookmarks.json"
+            source.write_text(json.dumps(data), encoding="utf-8")
+            with mock.patch.object(bookmark_helper, "MAX_BOOKMARKS", 1):
+                with self.assertRaisesRegex(ValueError, "more than 1"):
+                    bookmark_helper.import_bookmarks(str(source), "missing-store.json")
+
+    def test_rejects_oversized_bookmark_fields(self):
+        with mock.patch.object(bookmark_helper, "MAX_TITLE_LENGTH", 4):
+            self.assertIsNone(bookmark_helper.normalize_item({
+                "url": "https://example.com",
+                "title": "oversized",
+            }))
+        with mock.patch.object(bookmark_helper, "MAX_URL_LENGTH", 16):
+            self.assertEqual(bookmark_helper.valid_url("https://example.com/long"), "")
+
+
+class StoreLoadTests(unittest.TestCase):
+    def test_returns_a_bounded_store_document(self):
+        stored = {
+            "version": 3,
+            "bookmarks": [{"id": "one", "url": "https://example.com"}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bookmarks.json"
+            path.write_text(json.dumps(stored), encoding="utf-8")
+            result = bookmark_helper.load_store(str(path))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["bookmarks"][0]["id"], "one")
+
+    def test_rejects_store_bytes_and_count_before_qml(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bookmarks.json"
+            path.write_text('{"bookmarks":[]}', encoding="utf-8")
+            with mock.patch.object(bookmark_helper, "MAX_STORE_BYTES", 8):
+                with self.assertRaisesRegex(ValueError, "too large"):
+                    bookmark_helper.load_store(str(path))
+
+            path.write_text(json.dumps({
+                "bookmarks": [
+                    {"id": "one", "url": "https://one.example"},
+                    {"id": "two", "url": "https://two.example"},
+                ]
+            }), encoding="utf-8")
+            with mock.patch.object(bookmark_helper, "MAX_BOOKMARKS", 1):
+                with self.assertRaisesRegex(ValueError, "more than 1"):
+                    bookmark_helper.load_store(str(path))
+
+    def test_atomically_saves_a_bounded_store_from_stdin(self):
+        document = json.dumps({
+            "version": 3,
+            "bookmarks": [{"id": "one", "url": "https://example.com"}],
+        }) + "\n"
+        stdin = mock.Mock(buffer=io.BytesIO(document.encode("utf-8")))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bookmarks.json"
+            path.write_text('{"version":3,"bookmarks":[]}\n', encoding="utf-8")
+            path.chmod(0o600)
+            with mock.patch.object(bookmark_helper.sys, "stdin", stdin):
+                result = bookmark_helper.save_store(str(path))
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(path.read_text(encoding="utf-8"), document)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_oversized_stdin_does_not_replace_the_store(self):
+        stdin = mock.Mock(buffer=io.BytesIO(b"0123456789"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bookmarks.json"
+            path.write_text("original\n", encoding="utf-8")
+            with mock.patch.object(bookmark_helper, "MAX_STORE_BYTES", 4), \
+                    mock.patch.object(bookmark_helper.sys, "stdin", stdin):
+                with self.assertRaisesRegex(ValueError, "too large"):
+                    bookmark_helper.save_store(str(path))
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "original\n")
+
+
+class ImageSecurityTests(unittest.TestCase):
+    def test_rejects_unknown_and_oversized_images_before_imagemagick(self):
+        with mock.patch("bookmark_helper.subprocess.run") as run:
+            self.assertEqual(bookmark_helper.png_data_url(b"<svg></svg>"), "")
+            self.assertEqual(
+                bookmark_helper.png_data_url(
+                    png_header(bookmark_helper.MAX_ICON_DIMENSION + 1, 1)
+                ),
+                "",
+            )
+        run.assert_not_called()
+
+    @mock.patch("bookmark_helper.subprocess.run")
+    def test_uses_an_explicit_coder_and_hard_decoder_limits(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            [], 0, stdout=png_header(64, 64)
+        )
+
+        result = bookmark_helper.png_data_url(png_header(32, 24))
+
+        self.assertTrue(result.startswith("data:image/png;base64,"))
+        command = run.call_args.args[0]
+        self.assertIn("PNG:-[0]", command)
+        self.assertNotIn("-", command)
+        self.assertEqual(command[command.index("width") + 1], "4096")
+        self.assertEqual(command[command.index("height") + 1], "4096")
+        self.assertEqual(command[command.index("list-length") + 1], "16")
+
+    def test_detects_allowlisted_raster_headers(self):
+        self.assertEqual(bookmark_helper.image_input(png_header(12, 8)), ("PNG", 12, 8))
+        gif = b"GIF89a" + (12).to_bytes(2, "little") + (8).to_bytes(2, "little")
+        self.assertEqual(bookmark_helper.image_input(gif), ("GIF", 12, 8))
 
 
 class BackupTests(unittest.TestCase):
@@ -339,6 +475,72 @@ MimeType=x-scheme-handler/https;
         )
         self.assertTrue(result["browsers"][0]["isDefault"])
         self.assertFalse(result["browsers"][1]["isDefault"])
+
+    def test_skips_oversized_desktop_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "oversized.desktop"
+            path.write_text(
+                "[Desktop Entry]\nName=Browser\nMimeType=x-scheme-handler/https;\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(bookmark_helper, "MAX_DESKTOP_FILE_BYTES", 16):
+                self.assertIsNone(bookmark_helper.desktop_browser(path))
+
+    def test_caps_the_discovered_browser_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            applications = Path(directory)
+            for name in ("one", "two"):
+                (applications / f"{name}.desktop").write_text(
+                    "[Desktop Entry]\n"
+                    f"Name={name.title()} Browser\n"
+                    "MimeType=x-scheme-handler/https;\n",
+                    encoding="utf-8",
+                )
+            with mock.patch.object(bookmark_helper, "MAX_BROWSERS", 1):
+                result = bookmark_helper.discover_browsers([applications], "")
+
+        self.assertEqual(len(result["browsers"]), 1)
+
+    def test_skips_oversized_browser_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "browser.desktop"
+            path.write_text(
+                "[Desktop Entry]\n"
+                "Name=Oversized Browser Name\n"
+                "MimeType=x-scheme-handler/https;\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(bookmark_helper, "MAX_BROWSER_NAME_LENGTH", 4):
+                self.assertIsNone(bookmark_helper.desktop_browser(path))
+
+
+class QmlSecurityTests(unittest.TestCase):
+    def test_untrusted_text_sinks_are_plain_text(self):
+        checks = {
+            "Bookmarks.qml": (
+                "text: root.currentQuery() || root.modePlaceholder()",
+                "? root.displayTitle(row.bookmark)",
+                '"Search for “" + root.keywordAction.terms',
+            ),
+            "BookmarkImport.qml": (
+                "text: modelData.title || modelData.url",
+                "text: modelData.url",
+            ),
+            "BrowserPicker.qml": (
+                "text: root.bookmarkTitle",
+                "browserRow.modelData.name",
+                "text: browserRow.modelData.id",
+            ),
+        }
+        for filename, needles in checks.items():
+            source = (PROJECT_ROOT / filename).read_text(encoding="utf-8")
+            for needle in needles:
+                with self.subTest(filename=filename, needle=needle):
+                    position = source.index(needle)
+                    self.assertIn(
+                        "textFormat: Text.PlainText",
+                        source[position:position + 1000],
+                    )
 
 
 if __name__ == "__main__":

@@ -60,6 +60,26 @@ ShellRoot {
       return
     }
 
+    if (!root.check(
+      store.utf8ByteLength("Aé😀", 0) === 7,
+      "UTF-8 byte accounting is incorrect"
+    ) || !root.check(
+      store.normalizedBookmark({
+        id: "oversized-title",
+        title: "x".repeat(store.maxTitleLength + 1),
+        url: "https://example.com"
+      }, true) === null,
+      "accepted an oversized bookmark title"
+    ) || !root.check(
+      store.normalizedBookmark({
+        id: "oversized-url",
+        url: "https://example.com/" + "x".repeat(store.maxUrlLength)
+      }, true) === null,
+      "accepted an oversized bookmark URL"
+    )) {
+      return
+    }
+
     store.parse('{not-json')
     if (!root.check(store.recoveryRequired, "invalid JSON did not enter recovery mode")
         || !root.check(!store.canMutate, "invalid JSON remained writable")

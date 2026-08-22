@@ -14,6 +14,9 @@ Item {
   property string error: ""
   property var result: null
 
+  readonly property int maxImportOutputCharacters: 128 * 1024 * 1024
+  readonly property int maxBookmarks: 50000
+
   signal confirmed(var items)
   signal canceled()
 
@@ -85,8 +88,14 @@ Item {
         return
       root.loading = false
       try {
-        var parsed = JSON.parse(String(importOutput.text || ""))
-        if (exitCode === 0 && parsed.ok) {
+        var output = String(importOutput.text || "")
+        if (output.length > root.maxImportOutputCharacters)
+          throw new Error("Bookmark import returned too much data")
+        var parsed = JSON.parse(output)
+        if (exitCode === 0
+            && parsed.ok
+            && Array.isArray(parsed.items)
+            && parsed.items.length <= root.maxBookmarks) {
           root.result = parsed
           root.error = ""
         } else {
@@ -151,6 +160,7 @@ Item {
             : root.result
               ? root.result.stats.ready + " unique URL bookmarks are ready"
               : "Choose an exported bookmarks file"
+        textFormat: Text.PlainText
         color: root.error ? Color.urgent : Color.menu.text
         font.family: Style.font.menuFamily
         font.pixelSize: Style.font.heading
@@ -211,6 +221,7 @@ Item {
           Text {
             width: parent.width
             text: modelData.title || modelData.url
+            textFormat: Text.PlainText
             color: Color.menu.selectedText
             font.family: Style.font.menuFamily
             font.pixelSize: Style.font.body
@@ -220,6 +231,7 @@ Item {
           Text {
             width: parent.width
             text: modelData.url
+            textFormat: Text.PlainText
             color: Color.menu.selectedText
             opacity: 0.56
             font.family: Style.font.menuFamily

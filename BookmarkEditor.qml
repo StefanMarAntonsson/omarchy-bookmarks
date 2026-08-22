@@ -277,6 +277,7 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
 
         text: root.validationError
+        textFormat: Text.PlainText
         visible: text !== ""
         color: Color.urgent
         font.family: Style.font.menuFamily

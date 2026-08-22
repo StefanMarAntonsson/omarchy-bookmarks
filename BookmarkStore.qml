@@ -21,6 +21,15 @@ Item {
     root.localPath("bookmark_store_init.sh")
   readonly property real usageHalfLifeDays: 30
   readonly property int usageBatchSize: 5
+  readonly property int maxStoreBytes: 64 * 1024 * 1024
+  readonly property int maxStoreResponseCharacters: maxStoreBytes * 2 + 1024 * 1024
+  readonly property int maxBookmarks: 50000
+  readonly property int maxTitleLength: 2048
+  readonly property int maxUrlLength: 8192
+  readonly property int maxIdLength: 256
+  readonly property int maxTags: 64
+  readonly property int maxTagLength: 128
+  readonly property int maxKeywordLength: 128
 
   property var bookmarks: []
   property bool loaded: false
@@ -108,8 +117,12 @@ Item {
 
   function normalizeUrl(value) {
     var url = String(value || "").trim()
+    if (url.length > root.maxUrlLength)
+      return ""
     if (url && !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(url))
       url = "https://" + url
+    if (url.length > root.maxUrlLength)
+      return ""
     var match = url.match(/^(https?):\/\/([^\/?#\s]+)([\s\S]*)$/i)
     if (!match || match[2].indexOf("@") !== -1 || /\s/.test(url))
       return ""
@@ -209,10 +222,10 @@ Item {
     var source = Array.isArray(value) ? value : String(value || "").split(",")
     var tags = []
     var seen = ({})
-    for (var i = 0; i < source.length; i++) {
+    for (var i = 0; i < source.length && tags.length < root.maxTags; i++) {
       var tag = String(source[i]).trim()
       var key = "tag:" + tag.toLowerCase()
-      if (tag && !seen[key]) {
+      if (tag && tag.length <= root.maxTagLength && !seen[key]) {
         tags.push(tag)
         seen[key] = true
       }
@@ -226,7 +239,11 @@ Item {
 
   function normalizeKeyword(value) {
     var keyword = String(value || "").trim()
-    return keyword && !/\s/.test(keyword) ? keyword : ""
+    return keyword
+      && keyword.length <= root.maxKeywordLength
+      && !/\s/.test(keyword)
+        ? keyword
+        : ""
   }
 
   function normalizeFavicon(value) {
@@ -257,14 +274,30 @@ Item {
   }
 
   function normalizedBookmark(item, keepId) {
-    if (!item)
+    if (!item || typeof item !== "object")
       return null
+    var identifier = String(item.id || "")
+    var title = String(item.title || "").trim()
+    var keyword = String(item.keyword || "").trim()
+    var rawTags = Array.isArray(item.tags)
+      ? item.tags
+      : String(item.tags || "").split(",")
+    if ((keepId && (!identifier || identifier.length > root.maxIdLength))
+        || title.length > root.maxTitleLength
+        || keyword.length > root.maxKeywordLength
+        || rawTags.length > root.maxTags) {
+      return null
+    }
+    for (var tagIndex = 0; tagIndex < rawTags.length; tagIndex++) {
+      if (String(rawTags[tagIndex]).trim().length > root.maxTagLength)
+        return null
+    }
     var url = root.normalizeUrl(item.url)
     if (!url)
       return null
     return {
-      id: keepId ? String(item.id || root.newId()) : root.newId(),
-      title: String(item.title || "").trim(),
+      id: keepId ? identifier : root.newId(),
+      title: title,
       url: url,
       tags: root.normalizeTags(item.tags),
       keyword: root.normalizeKeyword(item.keyword),
@@ -278,61 +311,106 @@ Item {
     return Date.now().toString(36) + "-" + Math.floor(Math.random() * 16777216).toString(36)
   }
 
+  function utf8ByteLength(value, stopAfter) {
+    var text = String(value || "")
+    var bytes = 0
+    for (var index = 0; index < text.length; index++) {
+      var code = text.charCodeAt(index)
+      if (code < 0x80) {
+        bytes++
+      } else if (code < 0x800) {
+        bytes += 2
+      } else if (code >= 0xD800 && code <= 0xDBFF
+                 && index + 1 < text.length
+                 && text.charCodeAt(index + 1) >= 0xDC00
+                 && text.charCodeAt(index + 1) <= 0xDFFF) {
+        bytes += 4
+        index++
+      } else {
+        bytes += 3
+      }
+      if (stopAfter && bytes > stopAfter)
+        return bytes
+    }
+    return bytes
+  }
+
+  function applyParsedData(data, preliminaryInvalid) {
+    var source
+    if (Array.isArray(data)) {
+      source = data
+    } else if (data && typeof data === "object" && Array.isArray(data.bookmarks)) {
+      source = data.bookmarks
+      if (Number(data.version || 0) > 3)
+        throw new Error("bookmarks.json uses a newer data format")
+    } else {
+      throw new Error("bookmarks.json must contain a bookmarks array")
+    }
+    if (source.length > root.maxBookmarks)
+      throw new Error("bookmarks.json contains too many entries")
+
+    var result = []
+    var invalid = Math.max(0, Number(preliminaryInvalid || 0))
+    var seenIds = ({})
+    for (var i = 0; i < source.length; i++) {
+      var item = root.normalizedBookmark(source[i], true)
+      if (!item) {
+        invalid++
+        continue
+      }
+      var idKey = "id:" + item.id
+      if (seenIds[idKey]) {
+        invalid++
+        continue
+      }
+      seenIds[idKey] = true
+      result.push(item)
+    }
+    root.bookmarks = result
+    root.loaded = true
+    root.persistenceBlocked = false
+    if (invalid) {
+      root.recoveryRequired = true
+      root.error = "bookmarks.json contains " + invalid
+        + " invalid or duplicate " + (invalid === 1 ? "entry" : "entries")
+        + " · writes are disabled to protect the file"
+    } else {
+      root.recoveryRequired = false
+      root.error = ""
+    }
+  }
+
+  function failLoad(exception) {
+    root.bookmarks = []
+    root.loaded = true
+    root.recoveryRequired = true
+    root.persistenceBlocked = false
+    root.error = "Could not read bookmarks.json · writes are disabled to protect the file"
+    console.warn("Bookmarks:", exception)
+  }
+
   function parse(raw) {
     usageSaveTimer.stop()
     root.pendingUsageOpens = 0
     try {
-      var data = JSON.parse(String(raw || ""))
-      var source
-      if (Array.isArray(data)) {
-        source = data
-      } else if (data && typeof data === "object" && Array.isArray(data.bookmarks)) {
-        source = data.bookmarks
-        if (Number(data.version || 0) > 3)
-          throw new Error("bookmarks.json uses a newer data format")
-      } else {
-        throw new Error("bookmarks.json must contain a bookmarks array")
-      }
-
-      var result = []
-      var invalid = 0
-      var seenIds = ({})
-      for (var i = 0; i < source.length; i++) {
-        var item = root.normalizedBookmark(source[i], true)
-        if (!item) {
-          invalid++
-          continue
-        }
-        var idKey = "id:" + item.id
-        if (seenIds[idKey])
-          invalid++
-        seenIds[idKey] = true
-        result.push(item)
-      }
-      root.bookmarks = result
-      root.loaded = true
-      root.persistenceBlocked = false
-      if (invalid) {
-        root.recoveryRequired = true
-        root.error = "bookmarks.json contains " + invalid
-          + " invalid or duplicate " + (invalid === 1 ? "entry" : "entries")
-          + " · writes are disabled to protect the file"
-      } else {
-        root.recoveryRequired = false
-        root.error = ""
-      }
+      var text = String(raw || "")
+      if (root.utf8ByteLength(text, root.maxStoreBytes) > root.maxStoreBytes)
+        throw new Error("bookmarks.json is too large")
+      root.applyParsedData(JSON.parse(text), 0)
     } catch (exception) {
-      root.bookmarks = []
-      root.loaded = true
-      root.recoveryRequired = true
-      root.persistenceBlocked = false
-      root.error = "Could not read bookmarks.json · writes are disabled to protect the file"
-      console.warn("Bookmarks:", exception)
+      root.failLoad(exception)
     }
   }
 
   function reload() {
-    dataFile.reload()
+    if (!root.storageReady)
+      return
+    storeLoadProcess.command = [
+      "python3", root.localPath("bookmark_helper.py"),
+      "store-load", root.dataPath
+    ]
+    storeLoadProcess.running = false
+    storeLoadProcess.running = true
   }
 
   function save(next, createBackup) {
@@ -341,10 +419,17 @@ Item {
 
     usageSaveTimer.stop()
     root.pendingUsageOpens = 0
+    if (!Array.isArray(next) || next.length > root.maxBookmarks)
+      return false
+    var contents = JSON.stringify({version: 3, bookmarks: next}, null, 2) + "\n"
+    if (root.utf8ByteLength(contents, root.maxStoreBytes) > root.maxStoreBytes) {
+      root.error = "Bookmark data is too large to save"
+      return false
+    }
     root.bookmarks = next
     root.error = ""
     var request = {
-      contents: JSON.stringify({version: 3, bookmarks: next}, null, 2) + "\n",
+      contents: contents,
       createBackup: Boolean(createBackup)
     }
     var queue = root.saveQueue.slice()
@@ -384,8 +469,15 @@ Item {
   }
 
   function writeActiveSave() {
-    if (root.activeSave !== null)
-      dataFile.setText(root.activeSave.contents)
+    if (root.activeSave === null)
+      return
+    storeSaveProcess.stdinEnabled = true
+    storeSaveProcess.command = [
+      "python3", root.localPath("bookmark_helper.py"),
+      "store-save", root.dataPath
+    ]
+    storeSaveProcess.running = false
+    storeSaveProcess.running = true
   }
 
   function finishActiveSave(success, message) {
@@ -511,7 +603,7 @@ Item {
   }
 
   function importBookmarks(items) {
-    if (!root.canMutate)
+    if (!root.canMutate || !Array.isArray(items) || items.length > root.maxBookmarks)
       return {added: 0, updated: 0, unchanged: 0, blocked: true}
     var next = root.bookmarks.slice()
     var positions = ({})
@@ -589,7 +681,84 @@ Item {
       }
 
       root.storageReady = true
-      Qt.callLater(function() { dataFile.reload() })
+      Qt.callLater(root.reload)
+    }
+  }
+
+  Process {
+    id: storeLoadProcess
+    running: false
+    command: ["true"]
+
+    stdout: StdioCollector {
+      id: storeLoadOutput
+      waitForEnd: true
+    }
+
+    stderr: StdioCollector {
+      id: storeLoadError
+      waitForEnd: true
+    }
+
+    onExited: function(exitCode) {
+      usageSaveTimer.stop()
+      root.pendingUsageOpens = 0
+      try {
+        var output = String(storeLoadOutput.text || "")
+        if (output.length > root.maxStoreResponseCharacters)
+          throw new Error("Bounded store reader returned too much data")
+        var result = JSON.parse(output)
+        if (exitCode !== 0 || !result.ok || !result.data)
+          throw new Error(String(result.error || "Could not read bookmarks.json"))
+        root.applyParsedData(result.data, result.invalid)
+      } catch (exception) {
+        root.failLoad(
+          storeLoadError.text
+            ? String(storeLoadError.text).trim()
+            : exception
+        )
+      }
+    }
+  }
+
+  Process {
+    id: storeSaveProcess
+    running: false
+    command: ["true"]
+    stdinEnabled: true
+
+    stdout: StdioCollector {
+      id: storeSaveOutput
+      waitForEnd: true
+    }
+
+    stderr: StdioCollector {
+      id: storeSaveError
+      waitForEnd: true
+    }
+
+    onStarted: {
+      if (root.activeSave !== null)
+        write(root.activeSave.contents)
+      stdinEnabled = false
+    }
+
+    onExited: function(exitCode) {
+      var message = "Could not save bookmarks.json · writes are disabled"
+      try {
+        var result = JSON.parse(String(storeSaveOutput.text || ""))
+        if (exitCode !== 0 || !result.ok) {
+          if (result.error)
+            message += " · " + result.error
+          root.finishActiveSave(false, message)
+          return
+        }
+        root.finishActiveSave(true, "")
+      } catch (exception) {
+        if (storeSaveError.text)
+          message += " · " + String(storeSaveError.text).trim()
+        root.finishActiveSave(false, message)
+      }
     }
   }
 
@@ -636,28 +805,12 @@ Item {
   FileView {
     id: dataFile
     path: root.storageReady ? root.dataPath : ""
+    preload: false
     watchChanges: true
-    atomicWrites: true
     printErrors: false
-    onLoaded: root.parse(text())
     onFileChanged: {
       if (!root.saving && !root.pendingUsageOpens)
-        reload()
-    }
-    onSaved: root.finishActiveSave(true, "")
-    onSaveFailed: root.finishActiveSave(
-      false,
-      "Could not save bookmarks.json · writes are disabled"
-    )
-    onLoadFailed: {
-      if (!root.storageReady)
-        return
-      root.bookmarks = []
-      root.loaded = true
-      root.recoveryRequired = true
-      root.persistenceBlocked = false
-      root.error = "Could not read " + root.dataPath
-        + " · writes are disabled to protect the file"
+        root.reload()
     }
   }
 }

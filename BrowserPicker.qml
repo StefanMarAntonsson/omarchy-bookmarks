@@ -14,11 +14,17 @@ Item {
   property var browsers: []
   property int selectedIndex: 0
 
+  readonly property int maxBrowserOutputCharacters: 2 * 1024 * 1024
+  readonly property int maxBrowsers: 256
+  readonly property int maxBrowserNameLength: 512
+  readonly property int maxBrowserIdLength: 256
+  readonly property int maxDesktopPathLength: 4096
+
   signal selected(var browser)
   signal canceled()
 
   function openFor(title) {
-    root.bookmarkTitle = String(title || "")
+    root.bookmarkTitle = String(title || "").substring(0, 2048)
     root.error = ""
     root.browsers = []
     root.selectedIndex = 0
@@ -58,6 +64,30 @@ Item {
     var browser = root.browsers[index]
     root.close()
     root.selected(browser)
+  }
+
+  function normalizedBrowser(item) {
+    if (!item || typeof item !== "object")
+      return null
+    var identifier = String(item.id || "")
+    var name = String(item.name || "")
+    var desktopPath = String(item.desktopPath || "")
+    if (!identifier
+        || identifier.length > root.maxBrowserIdLength
+        || !name
+        || name.length > root.maxBrowserNameLength
+        || !desktopPath
+        || desktopPath.length > root.maxDesktopPathLength
+        || desktopPath.charAt(0) !== "/"
+        || desktopPath.substring(desktopPath.length - 8) !== ".desktop") {
+      return null
+    }
+    return {
+      id: identifier,
+      name: name,
+      desktopPath: desktopPath,
+      isDefault: item.isDefault === true
+    }
   }
 
   function handleKey(event) {
@@ -114,10 +144,24 @@ Item {
         return
       root.loading = false
       try {
-        var result = JSON.parse(String(browserOutput.text || ""))
+        var output = String(browserOutput.text || "")
+        if (output.length > root.maxBrowserOutputCharacters)
+          throw new Error("Browser discovery returned too much data")
+        var result = JSON.parse(output)
         if (exitCode !== 0 || !result.ok)
           throw new Error(String(result.error || "Could not find installed browsers"))
-        root.browsers = Array.isArray(result.browsers) ? result.browsers : []
+        if (!Array.isArray(result.browsers)
+            || result.browsers.length > root.maxBrowsers) {
+          throw new Error("Browser discovery returned an invalid browser list")
+        }
+        var browsers = []
+        for (var index = 0; index < result.browsers.length; index++) {
+          var browser = root.normalizedBrowser(result.browsers[index])
+          if (!browser)
+            throw new Error("Browser discovery returned an invalid browser entry")
+          browsers.push(browser)
+        }
+        root.browsers = browsers
         root.selectedIndex = 0
         if (!root.browsers.length)
           root.error = "No registered HTTPS browsers found"
@@ -168,6 +212,7 @@ Item {
         Text {
           width: parent.width
           text: root.bookmarkTitle
+          textFormat: Text.PlainText
           color: Color.menu.text
           opacity: 0.52
           font.family: Style.font.menuFamily
@@ -259,6 +304,7 @@ Item {
               text:
                 browserRow.modelData.name
                 + (browserRow.modelData.isDefault ? "  ·  Default" : "")
+              textFormat: Text.PlainText
               color:
                 browserRow.isSelected
                   ? Color.menu.selectedText
@@ -272,6 +318,7 @@ Item {
             Text {
               width: parent.width
               text: browserRow.modelData.id
+              textFormat: Text.PlainText
               color: Color.menu.text
               opacity: 0.52
               font.family: Style.font.menuFamily
@@ -295,6 +342,7 @@ Item {
         width: Style.space(360)
         visible: root.loading || root.error
         text: root.loading ? "Finding installed browsers…" : root.error
+        textFormat: Text.PlainText
         color: root.error ? Color.urgent : Color.menu.text
         opacity: root.error ? 1 : 0.7
         font.family: Style.font.menuFamily
