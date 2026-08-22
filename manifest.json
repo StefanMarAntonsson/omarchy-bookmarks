@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "stefanmara.bookmarks",
+  "name": "Bookmarks",
+  "version": "1.0.0",
+  "author": "Stefan Mar Antonsson",
+  "description": "Search, import, and manage URL bookmarks",
+  "kinds": ["menu"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "menu": "Bookmarks.qml"
+  }
+}

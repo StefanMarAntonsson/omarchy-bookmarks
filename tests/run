@@ -1,0 +1,43 @@
+#!/bin/sh
+
+set -eu
+
+project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$project_root"
+
+python3 -m unittest discover -s tests -p 'test_*.py'
+sh tests/test_store_init.sh
+python3 -m py_compile bookmark_helper.py
+
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy plugin validate "$project_root"
+fi
+
+if command -v qmllint >/dev/null 2>&1 && [ -d /usr/share/omarchy/shell ]; then
+  qmllint -I /usr/share/omarchy/shell \
+    Bookmarks.qml BrowserPicker.qml MenuEntryDialog.qml BookmarkStore.qml \
+    BookmarkEditor.qml BookmarkImport.qml
+fi
+
+if command -v quickshell >/dev/null 2>&1 && [ -d /usr/share/omarchy/shell ]; then
+  qml_test_root=$(mktemp -d)
+  trap 'rm -rf -- "$qml_test_root"' EXIT HUP INT TERM
+  qml_test_config="$qml_test_root/config"
+  mkdir -p "$qml_test_config"
+  cp tests/BookmarkStoreTest.qml BookmarkStore.qml \
+    bookmark_helper.py bookmark_store_init.sh "$qml_test_config/"
+  if ! qml_test_output=$(
+    HOME="$qml_test_root" XDG_DATA_HOME="$qml_test_root/data" \
+      timeout 20 quickshell --no-duplicate -p "$qml_test_config/BookmarkStoreTest.qml" \
+      2>&1
+  ); then
+    printf '%s\n' "$qml_test_output"
+    exit 1
+  fi
+  if printf '%s\n' "$qml_test_output" | grep -q BOOKMARK_STORE_TEST_PASS; then
+    printf '%s\n' "Quickshell persistence integration test: OK"
+  else
+    printf '%s\n' "$qml_test_output"
+    exit 1
+  fi
+fi
