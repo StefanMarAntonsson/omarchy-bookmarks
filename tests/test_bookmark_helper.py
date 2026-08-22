@@ -1,5 +1,6 @@
 import json
 import base64
+from email.message import Message
 import io
 import os
 from pathlib import Path
@@ -67,6 +68,288 @@ class UrlTests(unittest.TestCase):
             bookmark_helper.canonical_url("HTTPS://Example.COM:443"),
             "https://example.com/",
         )
+
+
+class SafeFetchTests(unittest.TestCase):
+    def headers(self, **values):
+        headers = Message()
+        for name, value in values.items():
+            headers[name.replace("_", "-")] = value
+        return headers
+
+    def test_accepts_only_globally_routable_addresses(self):
+        self.assertTrue(bookmark_helper._globally_routable_address("93.184.216.34"))
+        self.assertTrue(bookmark_helper._globally_routable_address("2606:4700:4700::1111"))
+        for address in (
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "fec0::1",
+            "::ffff:127.0.0.1",
+            "::ffff:8.8.8.8",
+            "2002:7f00:1::",
+        ):
+            with self.subTest(address=address):
+                self.assertFalse(bookmark_helper._globally_routable_address(address))
+
+    def test_old_python_runtime_fails_closed_for_network_access(self):
+        with mock.patch.object(bookmark_helper.sys, "version_info", (3, 12, 9)):
+            self.assertFalse(
+                bookmark_helper._globally_routable_address("93.184.216.34")
+            )
+
+    @mock.patch("bookmark_helper.socket.getaddrinfo")
+    def test_rejects_a_hostname_if_any_dns_answer_is_not_public(self, getaddrinfo):
+        getaddrinfo.return_value = [
+            (bookmark_helper.socket.AF_INET, bookmark_helper.socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+            (bookmark_helper.socket.AF_INET, bookmark_helper.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
+        ]
+
+        with self.assertRaisesRegex(bookmark_helper.UnsafeNetworkTarget, "non-public"):
+            bookmark_helper._resolve_public_addresses("example.com", 443)
+
+    @mock.patch("bookmark_helper.socket.socket")
+    def test_pinned_socket_connects_to_the_checked_literal_ip(self, socket_type):
+        stream = socket_type.return_value
+        stream.getpeername.return_value = ("93.184.216.34", 443)
+
+        result = bookmark_helper._pinned_socket("93.184.216.34", 443, 4)
+
+        self.assertIs(result, stream)
+        socket_type.assert_called_once_with(
+            bookmark_helper.socket.AF_INET,
+            bookmark_helper.socket.SOCK_STREAM,
+        )
+        stream.connect.assert_called_once_with(("93.184.216.34", 443))
+
+    @mock.patch("bookmark_helper._pinned_socket")
+    @mock.patch("bookmark_helper.ssl.create_default_context")
+    def test_tls_uses_the_original_hostname_for_verification(self, context_type, pinned):
+        context = context_type.return_value
+        wrapped = context.wrap_socket.return_value
+
+        connection = bookmark_helper._PinnedHTTPSConnection(
+            "example.com", 443, "93.184.216.34", 4
+        )
+        connection.connect()
+
+        pinned.assert_called_once_with("93.184.216.34", 443, 4)
+        context.wrap_socket.assert_called_once_with(
+            pinned.return_value, server_hostname="example.com"
+        )
+        self.assertIs(connection.sock, wrapped)
+
+    @mock.patch("bookmark_helper._PinnedHTTPSConnection")
+    def test_requests_do_not_include_ambient_credentials(self, connection_type):
+        response = connection_type.return_value.getresponse.return_value
+        response.status = 200
+        response.reason = "OK"
+        response.headers = self.headers(Content_Length="4")
+        response.read.return_value = b"page"
+
+        bookmark_helper._request_from_address(
+            "https", "example.com", 443, "/", "93.184.216.34",
+            1024, "text/html", 4,
+        )
+
+        headers = connection_type.return_value.request.call_args.kwargs["headers"]
+        self.assertEqual(headers["Accept-Encoding"], "identity")
+        self.assertNotIn("Cookie", headers)
+        self.assertNotIn("Authorization", headers)
+        self.assertNotIn("Referer", headers)
+
+    @mock.patch("bookmark_helper.socket.getaddrinfo")
+    def test_caps_public_connection_candidates_after_validating_all(self, getaddrinfo):
+        getaddrinfo.return_value = [
+            (
+                bookmark_helper.socket.AF_INET,
+                bookmark_helper.socket.SOCK_STREAM,
+                6,
+                "",
+                (f"1.1.1.{index}", 443),
+            )
+            for index in range(1, 9)
+        ]
+
+        addresses = bookmark_helper._resolve_public_addresses("example.com", 443)
+
+        self.assertEqual(len(addresses), bookmark_helper.MAX_FETCH_ADDRESSES)
+
+    def test_network_fetch_rejects_nondefault_ports(self):
+        with self.assertRaisesRegex(bookmark_helper.UnsafeNetworkTarget, "default"):
+            bookmark_helper.fetch_bytes(
+                "https://example.com:8443/", 1024, "text/html"
+            )
+
+    def test_network_fetch_rejects_scoped_hostnames(self):
+        with self.assertRaisesRegex(bookmark_helper.UnsafeNetworkTarget, "Scoped"):
+            bookmark_helper.fetch_bytes(
+                "http://[fe80::1%25eth0]/", 1024, "text/html"
+            )
+
+    @mock.patch("bookmark_helper._request_from_address")
+    @mock.patch("bookmark_helper._resolve_public_addresses")
+    def test_resolves_validates_and_pins_every_redirect(self, resolve, request):
+        resolve.side_effect = [["93.184.216.34"], ["203.0.113.8"]]
+        request.side_effect = [
+            (302, "Found", self.headers(Location="https://cdn.example/final"), b""),
+            (200, "OK", self.headers(Content_Type="text/html"), b"page"),
+        ]
+
+        raw, final_url, content_type = bookmark_helper.fetch_bytes(
+            "https://example.com/start", 1024, "text/html"
+        )
+
+        self.assertEqual(raw, b"page")
+        self.assertEqual(final_url, "https://cdn.example/final")
+        self.assertEqual(content_type, "text/html")
+        self.assertEqual(resolve.call_args_list, [
+            mock.call("example.com", 443),
+            mock.call("cdn.example", 443),
+        ])
+        self.assertEqual(request.call_args_list[0].args[4], "93.184.216.34")
+        self.assertEqual(request.call_args_list[1].args[4], "203.0.113.8")
+
+    @mock.patch("bookmark_helper._request_from_address")
+    @mock.patch("bookmark_helper._resolve_public_addresses")
+    def test_rejects_a_redirect_to_a_private_service(self, resolve, request):
+        resolve.side_effect = [
+            ["93.184.216.34"],
+            bookmark_helper.UnsafeNetworkTarget("non-public"),
+        ]
+        request.return_value = (
+            302,
+            "Found",
+            self.headers(Location="http://169.254.169.254/latest/meta-data/"),
+            b"",
+        )
+
+        with self.assertRaises(bookmark_helper.UnsafeNetworkTarget):
+            bookmark_helper.fetch_bytes(
+                "http://example.com/start", 1024, "text/html"
+            )
+
+        request.assert_called_once()
+
+    @mock.patch("bookmark_helper._request_from_address")
+    @mock.patch("bookmark_helper._resolve_public_addresses")
+    def test_rejects_an_https_downgrade_redirect(self, resolve, request):
+        resolve.return_value = ["93.184.216.34"]
+        request.return_value = (
+            302,
+            "Found",
+            self.headers(Location="http://example.com/final"),
+            b"",
+        )
+
+        with self.assertRaisesRegex(bookmark_helper.UnsafeNetworkTarget, "may not redirect"):
+            bookmark_helper.fetch_bytes(
+                "https://example.com/start", 1024, "text/html"
+            )
+
+    @mock.patch("bookmark_helper._request_from_address")
+    @mock.patch("bookmark_helper._resolve_public_addresses")
+    def test_can_lock_redirects_to_the_original_origin(self, resolve, request):
+        resolve.return_value = ["93.184.216.34"]
+        request.return_value = (
+            302,
+            "Found",
+            self.headers(Location="https://cdn.example/icon.png"),
+            b"",
+        )
+
+        with self.assertRaisesRegex(bookmark_helper.UnsafeNetworkTarget, "across origins"):
+            bookmark_helper.fetch_bytes(
+                "https://example.com/favicon.ico",
+                1024,
+                "image/*",
+                redirect_origin="https://example.com/",
+            )
+
+    @mock.patch("bookmark_helper.png_data_url", return_value="data:image/png;base64,AAAA")
+    @mock.patch("bookmark_helper.fetch_bytes")
+    def test_web_enrichment_uses_only_same_origin_icon_references(self, fetch, _png):
+        fetch.side_effect = [
+            (
+                b'<html><title>Example</title>'
+                b'<link rel="icon" href="https://attacker.example/icon.png">'
+                b'<link rel="icon" href="/safe.png"></html>',
+                "https://example.com/article",
+                "text/html",
+            ),
+            (b"png", "https://example.com/safe.png", "image/png"),
+        ]
+        result = bookmark_helper.enrich_url_from_web(
+            "https://example.com/article"
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["title"], "Example")
+        self.assertEqual(result["favicon"], "data:image/png;base64,AAAA")
+        self.assertEqual(fetch.call_args_list[1].args[0], "https://example.com/safe.png")
+        self.assertEqual(
+            fetch.call_args_list[1].kwargs["redirect_origin"],
+            "https://example.com/article",
+        )
+        self.assertNotIn("attacker.example", str(fetch.call_args_list))
+
+    @mock.patch(
+        "bookmark_helper._run_web_enrichment",
+        return_value=("Example", "data:image/png;base64,AAAA"),
+    )
+    @mock.patch("bookmark_helper.subprocess.run")
+    def test_opted_in_clipboard_path_uses_worker_result(self, run, enrich):
+        run.return_value = subprocess.CompletedProcess(
+            [], 0, stdout=b"https://example.com/article"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = bookmark_helper.clipboard_bookmark(
+                str(Path(directory) / "bookmarks.json"),
+                enrich_from_web=True,
+                settings_path=str(Path(directory) / "settings.json"),
+            )
+
+        enrich.assert_called_once_with(
+            "https://example.com/article", mock.ANY
+        )
+        self.assertEqual(result["item"]["title"], "Example")
+        self.assertEqual(result["item"]["favicon"], "data:image/png;base64,AAAA")
+
+    @mock.patch("bookmark_helper.subprocess.run")
+    def test_web_enrichment_worker_has_a_hard_timeout(self, run):
+        run.side_effect = subprocess.TimeoutExpired(["python"], 15)
+
+        self.assertEqual(
+            bookmark_helper._run_web_enrichment(
+                "https://example.com", "/tmp/settings.json"
+            ),
+            ("", ""),
+        )
+        self.assertEqual(run.call_args.kwargs["timeout"], 15)
+
+    @mock.patch("bookmark_helper.fetch_bytes")
+    @mock.patch("bookmark_helper.subprocess.run")
+    def test_default_clipboard_path_never_uses_the_network(self, run, fetch):
+        run.return_value = subprocess.CompletedProcess(
+            [], 0, stdout=b"http://127.0.0.1/admin"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = bookmark_helper.clipboard_bookmark(
+                str(Path(directory) / "bookmarks.json")
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["item"]["title"], "")
+        self.assertEqual(result["item"]["favicon"], "")
+        fetch.assert_not_called()
 
 
 class ImportTests(unittest.TestCase):
@@ -153,6 +436,31 @@ class ImportTests(unittest.TestCase):
 
         self.assertIsNotNone(item)
         self.assertEqual(item["favicon"], "data:image/png;base64," + encoded)
+
+    @mock.patch("bookmark_helper.subprocess.run")
+    def test_rerasterizes_favicons_from_external_json(self, run):
+        incoming = png_header(32, 32)
+        rendered = png_header(16, 16)
+        run.return_value = subprocess.CompletedProcess([], 0, stdout=rendered)
+        data = {
+            "bookmarks": [{
+                "url": "https://example.com",
+                "favicon": "data:image/png;base64,"
+                + base64.b64encode(incoming).decode("ascii"),
+            }]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "bookmarks.json"
+            source.write_text(json.dumps(data), encoding="utf-8")
+            result = bookmark_helper.import_bookmarks(
+                str(source), str(Path(directory) / "store.json")
+            )
+
+        self.assertEqual(
+            result["items"][0]["favicon"],
+            "data:image/png;base64," + base64.b64encode(rendered).decode("ascii"),
+        )
+        run.assert_called_once()
 
     def test_rejects_oversized_import_before_parsing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -299,6 +607,48 @@ class BackupTests(unittest.TestCase):
 
 
 class MenuEntryTests(unittest.TestCase):
+    def test_network_enrichment_defaults_off_and_preserves_menu_choice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+
+            initial = bookmark_helper.network_enrichment_operation(
+                "status", str(settings_path)
+            )
+            enabled = bookmark_helper.network_enrichment_operation(
+                "enable", str(settings_path)
+            )
+            bookmark_helper.write_menu_preference(str(settings_path), "installed")
+            stored = bookmark_helper.read_settings(str(settings_path))
+            disabled = bookmark_helper.network_enrichment_operation(
+                "disable", str(settings_path)
+            )
+
+        self.assertFalse(initial["enabled"])
+        self.assertTrue(enabled["enabled"])
+        self.assertEqual(stored["menuEntry"], "installed")
+        self.assertTrue(stored["networkEnrichment"])
+        self.assertFalse(disabled["enabled"])
+
+    def test_rejects_a_non_boolean_network_preference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            settings_path.write_text(
+                '{"version":1,"menuEntry":"pending","networkEnrichment":"yes"}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "invalid network"):
+                bookmark_helper.read_settings(str(settings_path))
+
+    def test_rejects_oversized_settings_before_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            settings_path.write_text("{}" * 20, encoding="utf-8")
+
+            with mock.patch.object(bookmark_helper, "MAX_SETTINGS_BYTES", 16):
+                with self.assertRaisesRegex(ValueError, "too large"):
+                    bookmark_helper.read_settings(str(settings_path))
+
     def test_installs_idempotently_and_preserves_existing_jsonc(self):
         original = """{
   // Keep this user's comment and formatting.
@@ -432,6 +782,56 @@ class ClipboardCopyTests(unittest.TestCase):
         run.assert_not_called()
 
 
+class CliSecurityTests(unittest.TestCase):
+    @mock.patch("builtins.print")
+    @mock.patch("bookmark_helper.enrich_url_from_web")
+    @mock.patch(
+        "bookmark_helper.read_settings",
+        return_value={"networkEnrichment": False},
+    )
+    def test_internal_worker_refuses_network_when_setting_is_off(
+        self, _read_settings, enrich, _print
+    ):
+        with mock.patch.object(
+            bookmark_helper.sys,
+            "argv",
+            ["bookmark_helper.py", "enrich-url", "/tmp/settings.json"],
+        ):
+            self.assertEqual(bookmark_helper.main(), 1)
+
+        enrich.assert_not_called()
+
+    @mock.patch("builtins.print")
+    @mock.patch("bookmark_helper.clipboard_bookmark")
+    @mock.patch("bookmark_helper.read_settings")
+    def test_enrichment_command_rechecks_persisted_opt_in(
+        self, read_settings, clipboard_bookmark, _print
+    ):
+        clipboard_bookmark.return_value = {"ok": True}
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                read_settings.return_value = {"networkEnrichment": enabled}
+                with mock.patch.object(
+                    bookmark_helper.sys,
+                    "argv",
+                    [
+                        "bookmark_helper.py",
+                        "clipboard-enrich",
+                        "/tmp/store.json",
+                        "/tmp/settings.json",
+                    ],
+                ):
+                    self.assertEqual(bookmark_helper.main(), 0)
+                self.assertEqual(
+                    clipboard_bookmark.call_args,
+                    mock.call(
+                        "/tmp/store.json",
+                        enrich_from_web=enabled,
+                        settings_path="/tmp/settings.json",
+                    ),
+                )
+
+
 class BrowserDiscoveryTests(unittest.TestCase):
     def test_discovers_https_handlers_and_sorts_default_first(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -515,6 +915,32 @@ MimeType=x-scheme-handler/https;
 
 
 class QmlSecurityTests(unittest.TestCase):
+    def test_paste_defaults_to_local_helper_and_opens_editor_before_saving(self):
+        source = (PROJECT_ROOT / "Bookmarks.qml").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'root.networkEnrichmentEnabled ? "clipboard-enrich" : "clipboard"',
+            source,
+        )
+        self.assertIn("clipboardCommand.push(root.menuPreferencePath)", source)
+        self.assertIn("editor.openForClipboard(result.item)", source)
+        quick_add_handler = source[
+            source.index("id: quickAddProcess"):source.index("id: copyProcess")
+        ]
+        self.assertNotIn("store.addBookmark", quick_add_handler)
+
+    def test_network_warning_is_plain_text_and_explains_the_risk(self):
+        source = (PROJECT_ROOT / "NetworkEnrichmentDialog.qml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("This is off by default", source)
+        self.assertIn("reveals your IP address", source)
+        self.assertIn("up to three public redirect destinations", source)
+        self.assertIn("fetching untrusted content is never risk-free", source)
+        self.assertIn("Enable anyway", source)
+        self.assertGreaterEqual(source.count("textFormat: Text.PlainText"), 3)
+
     def test_untrusted_text_sinks_are_plain_text(self):
         checks = {
             "Bookmarks.qml": (

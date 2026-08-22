@@ -7,7 +7,11 @@ Item {
 
   property bool opened: false
   property bool editing: false
+  property bool fromClipboard: false
+  property bool webDetailsEnabled: false
   property string bookmarkId: ""
+  property string initialUrl: ""
+  property string pendingFavicon: ""
   property string validationError: ""
   property var urlValidator: null
 
@@ -19,19 +23,29 @@ Item {
     string title,
     string url,
     string tags,
-    string keyword
+    string keyword,
+    string favicon
   )
 
   signal canceled()
+  signal webDetailsSettingsRequested()
 
   function openForCreate() {
+    root.openForClipboard(null)
+    root.fromClipboard = false
+  }
+
+  function openForClipboard(item) {
     root.editing = false
+    root.fromClipboard = Boolean(item)
     root.bookmarkId = ""
     root.validationError = ""
-    titleField.text = ""
-    urlField.text = ""
-    tagsField.text = ""
-    keywordField.text = ""
+    titleField.text = String(item && item.title || "")
+    urlField.text = String(item && item.url || "")
+    tagsField.text = item && Array.isArray(item.tags) ? item.tags.join(", ") : ""
+    keywordField.text = String(item && item.keyword || "")
+    root.initialUrl = String(item && item.url || "")
+    root.pendingFavicon = String(item && item.favicon || "")
     root.opened = true
 
     Qt.callLater(function() {
@@ -44,6 +58,7 @@ Item {
       return
 
     root.editing = true
+    root.fromClipboard = false
     root.bookmarkId = String(bookmark.id || "")
     root.validationError = ""
     titleField.text = String(bookmark.title || "")
@@ -52,6 +67,8 @@ Item {
       ? bookmark.tags.join(", ")
       : ""
     keywordField.text = String(bookmark.keyword || "")
+    root.initialUrl = String(bookmark.url || "")
+    root.pendingFavicon = String(bookmark.favicon || "")
     root.opened = true
 
     Qt.callLater(function() {
@@ -63,6 +80,15 @@ Item {
   function close() {
     root.opened = false
     root.validationError = ""
+    root.initialUrl = ""
+    root.pendingFavicon = ""
+  }
+
+  function refocus() {
+    Qt.callLater(function() {
+      if (root.opened)
+        titleField.forceActiveFocus()
+    })
   }
 
   function cancel() {
@@ -86,10 +112,14 @@ Item {
       return
     }
 
-    if (typeof root.urlValidator === "function" && !root.urlValidator(url)) {
-      root.validationError = "Enter a valid HTTP(S) URL"
-      urlField.forceActiveFocus()
-      return
+    var normalizedUrl = url
+    if (typeof root.urlValidator === "function") {
+      normalizedUrl = root.urlValidator(url)
+      if (!normalizedUrl) {
+        root.validationError = "Enter a valid HTTP(S) URL"
+        urlField.forceActiveFocus()
+        return
+      }
     }
 
     if (/\s/.test(keywordField.text.trim())) {
@@ -104,7 +134,8 @@ Item {
       title,
       url,
       tagsField.text,
-      keywordField.text
+      keywordField.text,
+      normalizedUrl === root.initialUrl ? root.pendingFavicon : ""
     )
   }
 
@@ -145,7 +176,11 @@ Item {
       height: Style.space(42)
 
       Text {
+        id: editorHeading
+
         anchors.left: parent.left
+        anchors.right: webDetailsControl.left
+        anchors.rightMargin: Style.spacing.md
         anchors.verticalCenter: parent.verticalCenter
 
         text: root.editing ? "Edit bookmark" : "Add bookmark"
@@ -153,17 +188,28 @@ Item {
         font.family: Style.font.menuFamily
         font.pixelSize: Style.font.title
         font.weight: Font.DemiBold
+        elide: Text.ElideRight
       }
 
       Text {
+        id: webDetailsControl
+
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
 
-        text: "Esc Cancel"
+        text: (root.webDetailsEnabled ? "Paste details: On" : "Paste details: Off")
+          + " · Change"
         color: Color.menu.text
-        opacity: 0.48
+        opacity: root.webDetailsEnabled ? 0.72 : 0.48
         font.family: Style.font.menuFamily
         font.pixelSize: Style.font.caption
+
+        MouseArea {
+          anchors.fill: parent
+          anchors.margins: -Style.spacing.sm
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.webDetailsSettingsRequested()
+        }
       }
     }
 
@@ -294,7 +340,9 @@ Item {
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
 
-        text: "Enter Next field    Ctrl+Enter Save"
+        text: root.fromClipboard && !root.webDetailsEnabled
+          ? "Web details off · add anything you want"
+          : "Enter Next field    Ctrl+Enter Save"
         color: Color.menu.text
         opacity: 0.48
         font.family: Style.font.menuFamily

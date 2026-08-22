@@ -8,6 +8,7 @@ import configparser
 from datetime import datetime
 import html
 from html.parser import HTMLParser
+from http.client import HTTPConnection, HTTPSConnection, HTTPException
 import ipaddress
 import json
 import math
@@ -15,13 +16,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 MAX_HTML = 1_000_000
@@ -46,13 +47,18 @@ MAX_BROWSERS = 256
 MAX_BROWSER_NAME_LENGTH = 512
 MAX_BROWSER_ICON_LENGTH = 1024
 MAX_PATH_LENGTH = 4096
+MAX_SETTINGS_BYTES = 16 * 1024
 MAX_ICON_CANDIDATES = 8
+MAX_FETCH_REDIRECTS = 3
+MAX_FETCH_ADDRESSES = 4
+MAX_ENRICHMENT_SECONDS = 15
+MAX_ENRICHMENT_OUTPUT = 256 * 1024
 BACKUP_LIMIT = 10
 USER_AGENT = "Omarchy Bookmarks/1.0"
 MENU_ENTRY_ID = "stefanmara-bookmarks"
 MENU_MARKER_BEGIN = "BEGIN stefanmara.bookmarks managed menu entry"
 MENU_MARKER_END = "END stefanmara.bookmarks managed menu entry"
-MENU_PREFERENCE_VERSION = 1
+SETTINGS_VERSION = 1
 
 
 def read_limited_text(path: Path, limit: int, description: str) -> str:
@@ -304,38 +310,81 @@ def menu_entry_present(menu_path: str) -> bool:
     return has_begin
 
 
-def read_menu_preference(preference_path: str) -> str:
-    """Read the user's menu-entry choice from plugin-owned data."""
-    path = Path(preference_path).expanduser()
+def read_settings(settings_path: str) -> dict[str, Any]:
+    """Read plugin-owned settings with network access defaulting to disabled."""
+    path = Path(settings_path).expanduser()
     if not path.exists():
-        return "pending"
+        return {
+            "version": SETTINGS_VERSION,
+            "menuEntry": "pending",
+            "networkEnrichment": False,
+        }
     if not path.is_file():
         raise ValueError("Bookmarks settings path is not a regular file")
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("version") != MENU_PREFERENCE_VERSION:
+    data = json.loads(read_limited_text(path, MAX_SETTINGS_BYTES, "Bookmarks settings"))
+    if not isinstance(data, dict) or data.get("version") != SETTINGS_VERSION:
         raise ValueError("Bookmarks settings use an unsupported format")
-    decision = data.get("menuEntry")
-    if decision not in ("installed", "dismissed"):
+    decision = data.get("menuEntry", "pending")
+    if decision not in ("pending", "installed", "dismissed"):
         raise ValueError("Bookmarks settings contain an invalid menu-entry choice")
-    return str(decision)
+    network_enrichment = data.get("networkEnrichment", False)
+    if not isinstance(network_enrichment, bool):
+        raise ValueError("Bookmarks settings contain an invalid network choice")
+    return {
+        "version": SETTINGS_VERSION,
+        "menuEntry": str(decision),
+        "networkEnrichment": network_enrichment,
+    }
 
 
-def write_menu_preference(preference_path: str, decision: str) -> None:
-    """Atomically persist a choice without writing to shared Omarchy config."""
-    if decision not in ("installed", "dismissed"):
+def write_settings(settings_path: str, settings: dict[str, Any]) -> None:
+    """Atomically persist validated settings without touching shared config."""
+    decision = settings.get("menuEntry", "pending")
+    network_enrichment = settings.get("networkEnrichment", False)
+    if decision not in ("pending", "installed", "dismissed"):
         raise ValueError("Invalid menu-entry choice")
-    path = Path(preference_path).expanduser()
+    if not isinstance(network_enrichment, bool):
+        raise ValueError("Invalid network choice")
+    path = Path(settings_path).expanduser()
     if path.exists() and not path.is_file():
         raise ValueError("Bookmarks settings path is not a regular file")
     if not path.parent.exists():
         path.parent.mkdir(parents=True, mode=0o700)
     mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
     value = json.dumps(
-        {"version": MENU_PREFERENCE_VERSION, "menuEntry": decision},
+        {
+            "version": SETTINGS_VERSION,
+            "menuEntry": decision,
+            "networkEnrichment": network_enrichment,
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     ) + "\n"
     _atomic_write_text(path, value, mode)
+
+
+def read_menu_preference(preference_path: str) -> str:
+    """Read the user's menu-entry choice from plugin-owned data."""
+    return str(read_settings(preference_path)["menuEntry"])
+
+
+def write_menu_preference(preference_path: str, decision: str) -> None:
+    """Update only the menu-entry choice while preserving safer defaults."""
+    settings = read_settings(preference_path)
+    settings["menuEntry"] = decision
+    write_settings(preference_path, settings)
+
+
+def network_enrichment_operation(operation: str, settings_path: str) -> dict[str, Any]:
+    """Inspect or explicitly update the opt-in network enrichment setting."""
+    settings = read_settings(settings_path)
+    if operation == "status":
+        return {"ok": True, "enabled": settings["networkEnrichment"]}
+    if operation not in ("enable", "disable"):
+        raise ValueError("network enrichment operation must be status, enable, or disable")
+    settings["networkEnrichment"] = operation == "enable"
+    write_settings(settings_path, settings)
+    return {"ok": True, "enabled": settings["networkEnrichment"]}
 
 
 def menu_entry_operation(
@@ -345,10 +394,12 @@ def menu_entry_operation(
 ) -> dict[str, Any]:
     """Inspect or apply an explicit user choice for main-menu integration."""
     if operation == "status":
+        settings = read_settings(preference_path)
         return {
             "ok": True,
             "installed": menu_entry_present(menu_path),
-            "decision": read_menu_preference(preference_path),
+            "decision": settings["menuEntry"],
+            "networkEnrichment": settings["networkEnrichment"],
             "path": str(Path(menu_path).expanduser()),
         }
     if operation == "install":
@@ -888,7 +939,7 @@ def load_store(path: str) -> dict[str, Any]:
     bookmarks: list[dict[str, Any]] = []
     invalid = 0
     for raw_item in source:
-        item = normalize_item(raw_item, process_icon=False)
+        item = normalize_item(raw_item, icon_policy="stored")
         identifier = (
             str(raw_item.get("id") or "").strip()
             if isinstance(raw_item, dict)
@@ -926,7 +977,11 @@ def save_store(path: str) -> dict[str, Any]:
     return {"ok": True}
 
 
-def normalize_item(item: Any, process_icon: bool = False) -> dict[str, Any] | None:
+def normalize_item(
+    item: Any,
+    icon_policy: str = "stored",
+    preserve_usage: bool = True,
+) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
     url = valid_url(item.get("url") or item.get("href"))
@@ -935,19 +990,22 @@ def normalize_item(item: Any, process_icon: bool = False) -> dict[str, Any] | No
     title = str(item.get("title") or "").strip()
     if len(title) > MAX_TITLE_LENGTH:
         return None
-    favicon = (
-        embedded_icon(item.get("iconSource"))
-        if process_icon
-        else stored_png_data_url(item.get("favicon"))
-    )
+    if icon_policy == "external":
+        favicon = embedded_icon(item.get("iconSource") or item.get("favicon"))
+    elif icon_policy == "none":
+        favicon = ""
+    elif icon_policy == "stored":
+        favicon = stored_png_data_url(item.get("favicon"))
+    else:
+        raise ValueError("Invalid favicon processing policy")
     try:
-        usage_score = float(item.get("usageScore") or 0) if not process_icon else 0.0
+        usage_score = float(item.get("usageScore") or 0) if preserve_usage else 0.0
         if not math.isfinite(usage_score) or usage_score < 0:
             usage_score = 0.0
     except (TypeError, ValueError):
         usage_score = 0.0
     try:
-        last_opened_at = int(item.get("lastOpenedAt") or 0) if not process_icon else 0
+        last_opened_at = int(item.get("lastOpenedAt") or 0) if preserve_usage else 0
         if last_opened_at < 0:
             last_opened_at = 0
     except (TypeError, ValueError, OverflowError):
@@ -976,7 +1034,8 @@ def import_bookmarks(source_arg: str, store_path: str) -> dict[str, Any]:
         parser.feed(raw)
         source_items = parser.items
         source_format = "HTML"
-        process_icons = True
+        external_icon_field = "iconSource"
+        preserve_usage = False
     else:
         data = json.loads(raw)
         if isinstance(data, list):
@@ -988,7 +1047,8 @@ def import_bookmarks(source_arg: str, store_path: str) -> dict[str, Any]:
         if not isinstance(source_items, list):
             raise ValueError("JSON must contain a bookmarks array")
         source_format = "JSON"
-        process_icons = False
+        external_icon_field = "favicon"
+        preserve_usage = True
 
     if len(source_items) > MAX_BOOKMARKS:
         raise ValueError(f"Bookmark file contains more than {MAX_BOOKMARKS} entries")
@@ -1004,14 +1064,17 @@ def import_bookmarks(source_arg: str, store_path: str) -> dict[str, Any]:
 
     for raw_item in source_items:
         should_process_icon = (
-            process_icons
-            and processed_icons < MAX_IMPORT_ICONS
+            processed_icons < MAX_IMPORT_ICONS
             and isinstance(raw_item, dict)
-            and bool(raw_item.get("iconSource"))
+            and bool(raw_item.get(external_icon_field))
         )
         if should_process_icon:
             processed_icons += 1
-        item = normalize_item(raw_item, should_process_icon)
+        item = normalize_item(
+            raw_item,
+            icon_policy="external" if should_process_icon else "none",
+            preserve_usage=preserve_usage,
+        )
         if item is None:
             rejected += 1
             continue
@@ -1096,20 +1159,248 @@ def create_store_backup(store_path: str, keep: int = BACKUP_LIMIT) -> dict[str, 
     }
 
 
-class LimitedRedirectHandler(HTTPRedirectHandler):
-    max_redirections = 5
+class UnsafeNetworkTarget(ValueError):
+    """A URL must not be fetched because its network destination is unsafe."""
 
 
-def fetch_bytes(url: str, limit: int, accept: str, timeout: int = 7) -> tuple[bytes, str, str]:
-    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": accept})
-    opener = build_opener(LimitedRedirectHandler())
-    with opener.open(request, timeout=timeout) as response:
-        final_url = valid_url(response.geturl())
-        content_type = response.headers.get_content_type()
+def _ascii_hostname(hostname: str) -> str:
+    """Return the unambiguous ASCII hostname used for DNS, TLS, and Host."""
+    hostname = hostname.rstrip(".")
+    if not hostname:
+        raise UnsafeNetworkTarget("URL has no hostname")
+    if "%" in hostname:
+        raise UnsafeNetworkTarget("Scoped or percent-encoded hostnames are not fetched")
+    try:
+        return str(ipaddress.ip_address(hostname))
+    except ValueError:
+        try:
+            encoded = hostname.encode("idna").decode("ascii").lower()
+        except (UnicodeError, ValueError) as error:
+            raise UnsafeNetworkTarget("URL hostname is invalid") from error
+        if (
+            not valid_hostname(encoded)
+            or any(not re.fullmatch(r"[a-z0-9-]+", label) for label in encoded.split("."))
+        ):
+            raise UnsafeNetworkTarget("URL hostname is invalid")
+        return encoded
+
+
+def _globally_routable_address(value: str) -> bool:
+    """Reject every special-purpose address, including embedded private IPv4."""
+    if sys.version_info < (3, 13):
+        # Python 3.13 corrected known is_global false positives and negatives.
+        # Older runtimes may store bookmarks but must not authorize fetching.
+        return False
+    try:
+        address = ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        if (
+            address.ipv4_mapped is not None
+            or address.sixtofour is not None
+            or address.teredo is not None
+            or address.is_site_local
+        ):
+            # Transition and deprecated site-local addresses are unnecessary
+            # here and have destination semantics that are easy to misread.
+            return False
+    return bool(
+        address.is_global
+        and not address.is_private
+        and not address.is_loopback
+        and not address.is_link_local
+        and not address.is_multicast
+        and not address.is_reserved
+        and not address.is_unspecified
+    )
+
+
+def _resolve_public_addresses(hostname: str, port: int) -> list[str]:
+    """Resolve once and reject the entire hostname if any answer is non-public."""
+    try:
+        answers = socket.getaddrinfo(
+            hostname,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
+    except socket.gaierror as error:
+        raise UnsafeNetworkTarget("URL hostname could not be resolved") from error
+
+    addresses: list[str] = []
+    for family, _type, _proto, _canonical, sockaddr in answers:
+        if family not in (socket.AF_INET, socket.AF_INET6) or not sockaddr:
+            raise UnsafeNetworkTarget("URL resolved to an unsupported address")
+        value = str(sockaddr[0]).split("%", 1)[0]
+        if not _globally_routable_address(value):
+            raise UnsafeNetworkTarget("URL resolved to a non-public address")
+        normalized = str(ipaddress.ip_address(value))
+        if normalized not in addresses:
+            addresses.append(normalized)
+    if not addresses:
+        raise UnsafeNetworkTarget("URL hostname had no public addresses")
+    return addresses[:MAX_FETCH_ADDRESSES]
+
+
+def _pinned_socket(address: str, port: int, timeout: int) -> socket.socket:
+    """Connect to the literal address that was checked, without another DNS lookup."""
+    parsed = ipaddress.ip_address(address)
+    family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
+    destination: tuple[Any, ...] = (
+        (address, port, 0, 0) if family == socket.AF_INET6 else (address, port)
+    )
+    stream = socket.socket(family, socket.SOCK_STREAM)
+    stream.settimeout(timeout)
+    try:
+        stream.connect(destination)
+        peer = str(stream.getpeername()[0]).split("%", 1)[0]
+        if ipaddress.ip_address(peer) != parsed or not _globally_routable_address(peer):
+            raise UnsafeNetworkTarget("Connected peer did not match the checked address")
+    except BaseException:
+        stream.close()
+        raise
+    return stream
+
+
+class _PinnedHTTPConnection(HTTPConnection):
+    def __init__(self, host: str, port: int, address: str, timeout: int) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._pinned_address = address
+
+    def connect(self) -> None:
+        self.sock = _pinned_socket(self._pinned_address, self.port, self.timeout)
+
+
+class _PinnedHTTPSConnection(HTTPSConnection):
+    def __init__(self, host: str, port: int, address: str, timeout: int) -> None:
+        super().__init__(host, port, timeout=timeout, context=ssl.create_default_context())
+        self._pinned_address = address
+
+    def connect(self) -> None:
+        stream = _pinned_socket(self._pinned_address, self.port, self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(stream, server_hostname=self.host)
+        except BaseException:
+            stream.close()
+            raise
+
+
+def _network_url_parts(url: str) -> tuple[str, str, int, str]:
+    value = valid_url(url)
+    if not value:
+        raise UnsafeNetworkTarget("URL is invalid")
+    parsed = urlsplit(value)
+    scheme = parsed.scheme.lower()
+    hostname = _ascii_hostname(parsed.hostname or "")
+    default_port = 443 if scheme == "https" else 80
+    port = parsed.port or default_port
+    if port != default_port:
+        raise UnsafeNetworkTarget("URL does not use the default HTTP(S) port")
+    path = quote(parsed.path or "/", safe="/%:@!$&'()*+,;=-._~")
+    if parsed.query:
+        path += "?" + quote(parsed.query, safe="/?%:@!$&'()*+,;=-._~")
+    return scheme, hostname, port, path
+
+
+def _request_from_address(
+    scheme: str,
+    hostname: str,
+    port: int,
+    path: str,
+    address: str,
+    limit: int,
+    accept: str,
+    timeout: int,
+) -> tuple[int, str, Any, bytes]:
+    connection_type = _PinnedHTTPSConnection if scheme == "https" else _PinnedHTTPConnection
+    connection = connection_type(hostname, port, address, timeout)
+    try:
+        connection.request("GET", path, headers={
+            "User-Agent": USER_AGENT,
+            "Accept": accept,
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+        })
+        response = connection.getresponse()
+        if response.status in (301, 302, 303, 307, 308):
+            return response.status, response.reason, response.headers, b""
+        encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
+        if encoding not in ("", "identity"):
+            raise ValueError("encoded responses are not accepted")
+        length = response.headers.get("Content-Length")
+        if length:
+            try:
+                content_length = int(length)
+            except ValueError as error:
+                raise ValueError("response has an invalid content length") from error
+            if content_length < 0:
+                raise ValueError("response has an invalid content length")
+            if content_length > limit:
+                raise ValueError("response is too large")
         raw = response.read(limit + 1)
         if len(raw) > limit:
             raise ValueError("response is too large")
-        return raw, final_url or url, content_type
+        return response.status, response.reason, response.headers, raw
+    finally:
+        connection.close()
+
+
+def fetch_bytes(
+    url: str,
+    limit: int,
+    accept: str,
+    timeout: int = 7,
+    redirect_origin: str = "",
+) -> tuple[bytes, str, str]:
+    """Fetch bounded public HTTP(S) content without DNS rebinding or auto-redirects."""
+    current_url = url
+    for redirect_count in range(MAX_FETCH_REDIRECTS + 1):
+        scheme, hostname, port, path = _network_url_parts(current_url)
+        addresses = _resolve_public_addresses(hostname, port)
+        last_error: BaseException | None = None
+        response: tuple[int, str, Any, bytes] | None = None
+        for address in addresses:
+            try:
+                response = _request_from_address(
+                    scheme, hostname, port, path, address, limit, accept, timeout
+                )
+                break
+            except (OSError, ssl.SSLError, HTTPException) as error:
+                last_error = error
+        if response is None:
+            raise OSError("Could not connect to the public URL") from last_error
+
+        status, reason, headers, raw = response
+        if status in (301, 302, 303, 307, 308):
+            if redirect_count >= MAX_FETCH_REDIRECTS:
+                raise ValueError("response redirected too many times")
+            location = headers.get("Location", "")
+            redirected = valid_url(urljoin(current_url, location))
+            if not redirected:
+                raise UnsafeNetworkTarget("response redirected to an invalid URL")
+            if scheme == "https" and urlsplit(redirected).scheme.lower() != "https":
+                raise UnsafeNetworkTarget("HTTPS responses may not redirect to HTTP")
+            if redirect_origin and not _same_origin(redirected, redirect_origin):
+                raise UnsafeNetworkTarget("response redirected across origins")
+            current_url = redirected
+            continue
+        if not 200 <= status < 300:
+            raise ValueError(f"HTTP request failed with status {status} {reason}")
+        return raw, current_url, headers.get_content_type()
+    raise ValueError("response redirected too many times")
+
+
+def _same_origin(first: str, second: str) -> bool:
+    try:
+        first_scheme, first_host, first_port, _ = _network_url_parts(first)
+        second_scheme, second_host, second_port, _ = _network_url_parts(second)
+    except (ValueError, UnicodeError):
+        return False
+    return (first_scheme, first_host, first_port) == (
+        second_scheme, second_host, second_port
+    )
 
 
 class MetadataParser(HTMLParser):
@@ -1154,7 +1445,105 @@ class MetadataParser(HTMLParser):
         return (title or self.og_title)[:MAX_TITLE_LENGTH]
 
 
-def clipboard_bookmark(store_path: str) -> dict[str, Any]:
+def enrich_url_from_web(url: str) -> dict[str, Any]:
+    """Fetch optional web details inside the time-bounded worker process."""
+    url = valid_url(url)
+    if not url:
+        raise ValueError("Web enrichment requires one valid HTTP(S) URL")
+
+    hostname = urlsplit(url).hostname or url
+    title = hostname
+    favicon = ""
+    try:
+        raw, final_url, content_type = fetch_bytes(
+            url, MAX_HTML, "text/html,application/xhtml+xml"
+        )
+        if (
+            content_type in ("text/html", "application/xhtml+xml")
+            or b"<html" in raw[:2048].lower()
+        ):
+            charset_match = re.search(
+                br"charset\s*=\s*['\"]?([A-Za-z0-9._-]+)", raw[:8192], re.I
+            )
+            charset = (
+                charset_match.group(1).decode("ascii", errors="ignore")
+                if charset_match
+                else "utf-8"
+            )
+            page = raw.decode(charset, errors="replace")
+            parser = MetadataParser()
+            parser.feed(page)
+            title = parser.title or hostname
+            icon_candidates = [
+                candidate
+                for value in parser.icons
+                if valid_url(candidate := urljoin(final_url, value))
+                and _same_origin(candidate, final_url)
+            ]
+            icon_candidates.append(urljoin(final_url, "/favicon.ico"))
+            seen_icons: set[str] = set()
+            for icon_url in icon_candidates[:4]:
+                key = canonical_url(
+                    urlunsplit(urlsplit(icon_url)._replace(fragment=""))
+                )
+                if not key or key in seen_icons:
+                    continue
+                seen_icons.add(key)
+                try:
+                    icon_raw, _, _ = fetch_bytes(
+                        icon_url,
+                        MAX_ICON_INPUT,
+                        "image/*",
+                        timeout=3,
+                        redirect_origin=final_url,
+                    )
+                    favicon = png_data_url(icon_raw)
+                    if favicon:
+                        break
+                except (OSError, ValueError):
+                    continue
+    except (OSError, ValueError, LookupError):
+        pass
+    return {"ok": True, "title": title, "favicon": favicon}
+
+
+def _run_web_enrichment(url: str, settings_path: str) -> tuple[str, str]:
+    """Run all optional network and decoder work behind a hard wall-clock limit."""
+    try:
+        process = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "enrich-url",
+                settings_path,
+            ],
+            input=url.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=MAX_ENRICHMENT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "", ""
+    if process.returncode != 0 or len(process.stdout) > MAX_ENRICHMENT_OUTPUT:
+        return "", ""
+    try:
+        result = json.loads(process.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "", ""
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return "", ""
+    title = str(result.get("title") or "").strip()
+    if len(title) > MAX_TITLE_LENGTH:
+        title = ""
+    return title, stored_png_data_url(result.get("favicon"))
+
+
+def clipboard_bookmark(
+    store_path: str,
+    enrich_from_web: bool = False,
+    settings_path: str = "",
+) -> dict[str, Any]:
     try:
         clipboard = subprocess.run(
             ["wl-paste", "--no-newline", "--type", "text"],
@@ -1175,32 +1564,14 @@ def clipboard_bookmark(store_path: str) -> dict[str, Any]:
         if canonical_url(item.get("url")) == key:
             return {"ok": True, "duplicate": True, "id": str(item.get("id") or ""), "url": url}
 
-    hostname = urlsplit(url).hostname or url
-    title = hostname
+    title = ""
     favicon = ""
-    try:
-        raw, final_url, content_type = fetch_bytes(url, MAX_HTML, "text/html,application/xhtml+xml")
-        if content_type in ("text/html", "application/xhtml+xml") or b"<html" in raw[:2048].lower():
-            charset_match = re.search(br"charset\s*=\s*['\"]?([A-Za-z0-9._-]+)", raw[:8192], re.I)
-            charset = charset_match.group(1).decode("ascii", errors="ignore") if charset_match else "utf-8"
-            page = raw.decode(charset, errors="replace")
-            parser = MetadataParser()
-            parser.feed(page)
-            title = parser.title or hostname
-            icon_candidates = [urljoin(final_url, value) for value in parser.icons]
-            icon_candidates.append(urljoin(final_url, "/favicon.ico"))
-            for icon_url in icon_candidates[:4]:
-                if not valid_url(icon_url):
-                    continue
-                try:
-                    icon_raw, _, _ = fetch_bytes(icon_url, MAX_ICON_INPUT, "image/*", timeout=3)
-                    favicon = png_data_url(icon_raw)
-                    if favicon:
-                        break
-                except (HTTPError, URLError, OSError, ValueError):
-                    continue
-    except (HTTPError, URLError, OSError, ValueError, LookupError):
-        pass
+    if enrich_from_web:
+        if not settings_path:
+            raise ValueError("Web enrichment requires an explicit settings path")
+        title, favicon = _run_web_enrichment(url, settings_path)
+        if not title:
+            title = urlsplit(url).hostname or url
 
     return {
         "ok": True,
@@ -1245,7 +1616,22 @@ def main() -> int:
         elif action == "store-save" and len(sys.argv) == 3:
             result = save_store(sys.argv[2])
         elif action == "clipboard" and len(sys.argv) == 3:
-            result = clipboard_bookmark(sys.argv[2])
+            result = clipboard_bookmark(sys.argv[2], enrich_from_web=False)
+        elif action == "clipboard-enrich" and len(sys.argv) == 4:
+            settings = read_settings(sys.argv[3])
+            result = clipboard_bookmark(
+                sys.argv[2],
+                enrich_from_web=settings["networkEnrichment"] is True,
+                settings_path=sys.argv[3],
+            )
+        elif action == "enrich-url" and len(sys.argv) == 3:
+            settings = read_settings(sys.argv[2])
+            if settings["networkEnrichment"] is not True:
+                raise ValueError("Web enrichment is disabled")
+            raw_url = sys.stdin.buffer.read(MAX_URL_LENGTH * 4 + 1)
+            if len(raw_url) > MAX_URL_LENGTH * 4:
+                raise ValueError("Web enrichment URL is too large")
+            result = enrich_url_from_web(raw_url.decode("utf-8"))
         elif action == "copy" and len(sys.argv) == 3:
             result = copy_url_to_clipboard(sys.argv[2])
         elif action == "browsers" and len(sys.argv) == 2:
@@ -1263,10 +1649,15 @@ def main() -> int:
                 else {"ok": True, "changed": False, "installed": True,
                       "path": sys.argv[3]}
             )
+        elif action == "network-enrichment" and len(sys.argv) == 4:
+            result = network_enrichment_operation(sys.argv[2], sys.argv[3])
         else:
             raise ValueError(
-                "usage: bookmark_helper.py import FILE STORE | clipboard STORE | copy URL | "
+                "usage: bookmark_helper.py import FILE STORE | clipboard STORE | "
+                "clipboard-enrich STORE SETTINGS | copy URL | "
+                "enrich-url SETTINGS < URL | "
                 "store-load STORE | store-save STORE | browsers | backup STORE | "
+                "network-enrichment {status|enable|disable} SETTINGS | "
                 "menu-entry {status|install|remove|dismiss} "
                 "FILE SETTINGS | menu-entry cleanup FILE"
             )

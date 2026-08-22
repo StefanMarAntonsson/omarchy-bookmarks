@@ -15,8 +15,8 @@ fi
 
 if command -v qmllint >/dev/null 2>&1 && [ -d /usr/share/omarchy/shell ]; then
   qmllint -I /usr/share/omarchy/shell \
-    Bookmarks.qml BrowserPicker.qml MenuEntryDialog.qml BookmarkStore.qml \
-    BookmarkEditor.qml BookmarkImport.qml
+    Bookmarks.qml BrowserPicker.qml MenuEntryDialog.qml NetworkEnrichmentDialog.qml \
+    BookmarkStore.qml BookmarkEditor.qml BookmarkImport.qml
 fi
 
 if command -v quickshell >/dev/null 2>&1 && [ -d /usr/share/omarchy/shell ]; then

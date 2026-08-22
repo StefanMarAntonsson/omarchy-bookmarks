@@ -15,7 +15,10 @@ applications, and follows the active Omarchy theme.
 - Browse dedicated bookmark, tag, and keyword lists with `Tab`.
 - Rank an empty search by frequently and recently opened bookmarks.
 - Add, edit, delete, and import bookmarks without leaving the menu.
-- Add an HTTP(S) URL directly from the clipboard and fetch its title/favicon.
+- Paste an HTTP(S) URL into the bookmark editor so its title, tags, and keyword
+  can be reviewed before saving.
+- Optionally fetch titles and favicons for pasted URLs after an explicit,
+  persisted opt-in. Web fetching is off by default.
 - Import Netscape bookmark HTML or this plugin's JSON format.
 - Open in a browser tab by default or in a new window with `Ctrl+T`.
 - Open a bookmark in any installed HTTPS browser with `Ctrl+Tab` without
@@ -31,7 +34,8 @@ JavaScript bookmarklets, `file:` URLs, `mailto:` links, and folders.
 ## Requirements
 
 - Omarchy with shell plugin support.
-- Python 3.
+- Python 3. Web enrichment fails closed on Python older than 3.13 because older
+  standard-library IP classifications contain known false results.
 - `zenity` for the import file picker.
 - `wl-clipboard` for adding from and copying to the clipboard.
 - ImageMagick for favicons from imported HTML and clipboard metadata. Bookmark
@@ -89,11 +93,11 @@ o.bind(
 | `Tab` | Show tags, then keywords |
 | `Ctrl+M` | Add or remove the main Omarchy menu entry |
 | `Ctrl+N` | Add a bookmark manually |
-| `Ctrl+V` | Add the HTTP(S) URL in the clipboard |
+| `Ctrl+V` | Open the editor with the HTTP(S) URL in the clipboard |
 | `Ctrl+I` | Import an HTML or JSON bookmark file |
 | `Ctrl+E` | Edit the selected bookmark |
+| `Ctrl+,` | Review or change the web-details preference |
 | `Delete` | Delete with confirmation |
-| `Ctrl+Z` | Undo the most recent clipboard addition |
 | `Escape` | Clear the search, then close |
 
 ### Tag and keyword lists
@@ -161,10 +165,25 @@ omarchy restart shell
 
 Use the corresponding `$XDG_DATA_HOME` path if that variable is configured.
 
-The plugin makes a network request only when `Ctrl+V` is used to fetch page
-metadata and a favicon. Browser discovery reads local desktop entries, and
-imported HTML is processed locally. Favicons are converted to small PNG data
-URLs and stored inside `bookmarks.json`.
+Web enrichment is **off by default**. In that state, `Ctrl+V` reads and validates
+the clipboard locally and opens the bookmark editor without making any network
+request. Use `Ctrl+,` or the **Paste details: Off** control in the editor to
+review a warning and explicitly enable enrichment. The choice is stored in the
+plugin's private `settings.json` and can be disabled again at any time.
+
+When enabled, pasting a new URL contacts the destination and up to three public
+redirect destinations to fetch its title and favicon. This reveals the user's
+IP address and each requested URL to those sites and processes downloaded page
+and image data locally. The fetcher permits only public HTTP(S) destinations on
+their default ports, pins connections to checked DNS addresses, validates every
+redirect, keeps favicon URLs and redirects on the final page origin, sends no
+cookies or authorization, and applies strict response, image,
+connection-attempt, and wall-clock limits. If enrichment fails or times
+out, the editor still opens with the pasted URL.
+
+Browser discovery and bookmark imports do not access the network. Imported and
+downloaded favicons are converted to small PNG data URLs and stored inside
+`bookmarks.json`.
 
 ## Updates and removal
 

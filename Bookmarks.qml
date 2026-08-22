@@ -22,7 +22,6 @@ Item {
   property bool quickAdding: false
   property bool quickAddCanceled: false
   property string statusMessage: ""
-  property string quickAddUndoId: ""
   property var browserTarget: null
   property string copyTargetTitle: ""
   property bool menuEntryDialogOpen: false
@@ -31,6 +30,10 @@ Item {
   property bool menuPromptCheckedForOpen: false
   property string menuEntryDecision: "pending"
   property string menuEntryOperation: ""
+  property bool networkEnrichmentEnabled: false
+  property bool networkSettingStateReady: false
+  property bool networkDialogOpen: false
+  property string networkSettingOperation: ""
 
   readonly property string helperPath:
     root.localPath("bookmark_helper.py")
@@ -453,11 +456,11 @@ Item {
     root.deleteTarget = null
     root.fileDialogOpen = false
     root.statusMessage = ""
-    root.quickAddUndoId = ""
     root.quickAddCanceled = false
     root.browserTarget = null
     root.copyTargetTitle = ""
     root.menuEntryDialogOpen = false
+    root.networkDialogOpen = false
     root.menuPromptCheckedForOpen = false
     editor.close()
     importer.close()
@@ -485,10 +488,10 @@ Item {
     root.deleteConfirmOpen = false
     root.deleteTarget = null
     root.statusMessage = ""
-    root.quickAddUndoId = ""
     root.browserTarget = null
     root.copyTargetTitle = ""
     root.menuEntryDialogOpen = false
+    root.networkDialogOpen = false
     editor.close()
     importer.close()
     browserPicker.close()
@@ -523,6 +526,7 @@ Item {
         && !importer.opened
         && !browserPicker.opened
         && !root.menuEntryDialogOpen
+        && !root.networkDialogOpen
         && !root.deleteConfirmOpen
       ) {
         keyCatcher.forceActiveFocus()
@@ -564,7 +568,6 @@ Item {
   function beginAdd() {
     if (!root.mutationAvailable(true))
       return
-    root.clearUndo()
     root.deleteConfirmOpen = false
     root.deleteTarget = null
     editor.openForCreate()
@@ -576,7 +579,6 @@ Item {
     var bookmark = root.selectedBookmark()
 
     if (bookmark) {
-      root.clearUndo()
       editor.openForEdit(bookmark)
     }
   }
@@ -586,20 +588,20 @@ Item {
     title,
     url,
     tags,
-    keyword
+    keyword,
+    favicon
   ) {
     if (!root.mutationAvailable(false)) {
       editor.validationError = store.error || "Bookmark storage is not writable"
       return
     }
-    root.clearUndo()
     var selectedId = bookmarkId
     var saved = false
 
     if (bookmarkId) {
       saved = store.updateBookmark(bookmarkId, title, url, tags, keyword)
     } else {
-      selectedId = store.addBookmark(title, url, tags, keyword, "")
+      selectedId = store.addBookmark(title, url, tags, keyword, favicon)
       saved = Boolean(selectedId)
     }
 
@@ -622,8 +624,6 @@ Item {
 
     if (!bookmark)
       return
-
-    root.clearUndo()
 
     root.deleteTarget = bookmark
     root.deleteConfirmOpen = true
@@ -723,10 +723,6 @@ Item {
       root.applyPickerSelection(append)
   }
 
-  function clearUndo() {
-    root.quickAddUndoId = ""
-  }
-
   function showStatus(message) {
     root.statusMessage = message
     statusTimer.restart()
@@ -807,31 +803,58 @@ Item {
       return
     root.quickAdding = true
     root.quickAddCanceled = false
-    root.showStatus("Reading clipboard and fetching bookmark details…")
-    quickAddProcess.command = ["python3", root.helperPath, "clipboard", store.dataPath]
+    root.showStatus(
+      root.networkEnrichmentEnabled
+        ? "Reading clipboard and fetching optional web details…"
+        : "Reading clipboard…"
+    )
+    var clipboardCommand = [
+      "python3",
+      root.helperPath,
+      root.networkEnrichmentEnabled ? "clipboard-enrich" : "clipboard",
+      store.dataPath
+    ]
+    if (root.networkEnrichmentEnabled)
+      clipboardCommand.push(root.menuPreferencePath)
+    quickAddProcess.command = clipboardCommand
     quickAddProcess.running = false
     quickAddProcess.running = true
   }
 
-  function undoQuickAdd() {
-    if (!root.quickAddUndoId)
-      return
-    if (!root.mutationAvailable(true)) {
+  function openNetworkSettings() {
+    if (!root.networkSettingStateReady) {
+      root.showStatus("Web-details preference is still loading…")
       return
     }
-    var id = root.quickAddUndoId
-    root.quickAddUndoId = ""
-    if (store.removeBookmark(id)) {
-      root.viewMode = 0
-      root.query = ""
-      root.showStatus("Clipboard bookmark removed")
-    }
+    networkDialog.errorMessage = ""
+    networkDialog.selectedIndex = 0
+    root.networkDialogOpen = true
+  }
+
+  function closeNetworkSettings() {
+    root.networkDialogOpen = false
+    if (editor.opened)
+      editor.refocus()
+    else
+      root.refocusList()
+  }
+
+  function requestNetworkSetting(enabled) {
+    if (networkSettingProcess.running)
+      return
+    root.networkSettingOperation = enabled ? "enable" : "disable"
+    networkDialog.errorMessage = ""
+    networkSettingProcess.command = [
+      "python3", root.helperPath,
+      "network-enrichment", root.networkSettingOperation,
+      root.menuPreferencePath
+    ]
+    networkSettingProcess.running = true
   }
 
   function openImportPicker() {
     if (!root.mutationAvailable(true))
       return
-    root.clearUndo()
     root.fileDialogOpen = true
     importPickerProcess.command = [
       "zenity",
@@ -846,7 +869,6 @@ Item {
   }
 
   function finishImport(items) {
-    root.clearUndo()
     var outcome = store.importBookmarks(items)
     if (outcome.blocked) {
       root.showStatus(store.error || "Bookmark storage is not writable")
@@ -905,20 +927,7 @@ Item {
           root.selectBookmarkById(result.id)
           root.showStatus("That URL is already bookmarked")
         } else {
-          root.clearUndo()
-          var item = result.item
-          var id = store.addBookmark(
-            item.title, item.url, item.tags, item.keyword, item.favicon
-          )
-          if (!id) {
-            root.showStatus(store.error || "Could not save clipboard bookmark")
-          } else {
-            root.viewMode = 0
-            root.query = ""
-            root.selectBookmarkById(id)
-            root.quickAddUndoId = id
-            root.showStatus("Added " + root.displayTitle(item) + " · Ctrl+Z Undo")
-          }
+          editor.openForClipboard(result.item)
         }
       } catch (exception) {
         root.showStatus(String(quickAddError.text || "Could not add clipboard bookmark").trim())
@@ -970,9 +979,13 @@ Item {
         root.menuEntryInstalled = Boolean(result.installed)
         root.menuEntryDecision = String(result.decision || "pending")
         root.menuEntryStateReady = true
+        root.networkEnrichmentEnabled = result.networkEnrichment === true
+        root.networkSettingStateReady = true
         root.maybeShowMenuConsent()
       } catch (exception) {
         root.menuEntryStateReady = false
+        root.networkEnrichmentEnabled = false
+        root.networkSettingStateReady = false
         root.showStatus(String(exception.message || "Could not inspect main-menu entry"))
       }
     }
@@ -1007,6 +1020,42 @@ Item {
       }
       root.menuEntryOperation = ""
       root.refocusList()
+    }
+  }
+
+  Process {
+    id: networkSettingProcess
+    running: false
+    command: ["true"]
+
+    stdout: StdioCollector {
+      id: networkSettingOutput
+      waitForEnd: true
+    }
+
+    onExited: function(exitCode) {
+      try {
+        var result = JSON.parse(String(networkSettingOutput.text || ""))
+        if (exitCode !== 0 || !result.ok)
+          throw new Error(String(result.error || "Could not save web-details preference"))
+        root.networkEnrichmentEnabled = result.enabled === true
+        root.networkSettingStateReady = true
+        root.networkDialogOpen = false
+        root.showStatus(
+          root.networkEnrichmentEnabled
+            ? "Web details enabled for future pasted URLs"
+            : "Web details disabled · pasting will not access the network"
+        )
+        if (editor.opened)
+          editor.refocus()
+        else
+          root.refocusList()
+      } catch (exception) {
+        networkDialog.errorMessage = String(
+          exception.message || "Could not save web-details preference"
+        )
+      }
+      root.networkSettingOperation = ""
     }
   }
 
@@ -1116,6 +1165,12 @@ Item {
         Keys.priority: Keys.BeforeItem
 
         Keys.onPressed: function(event) {
+          if (root.networkDialogOpen) {
+            if (networkDialog.handleKey(event))
+              event.accepted = true
+            return
+          }
+
           if (root.menuEntryDialogOpen) {
             if (menuEntryDialog.handleKey(event))
               event.accepted = true
@@ -1163,13 +1218,6 @@ Item {
             )
             event.accepted = true
           } else if (
-            event.key === Qt.Key_Z
-            && event.modifiers === Qt.ControlModifier
-            && root.quickAddUndoId
-          ) {
-            root.undoQuickAdd()
-            event.accepted = true
-          } else if (
             event.key === Qt.Key_C
             && event.modifiers === Qt.ControlModifier
             && root.viewMode === 0
@@ -1193,6 +1241,12 @@ Item {
             && event.modifiers === Qt.ControlModifier
           ) {
             root.openMenuEntryManager()
+            event.accepted = true
+          } else if (
+            event.key === Qt.Key_Comma
+            && event.modifiers === Qt.ControlModifier
+          ) {
+            root.openNetworkSettings()
             event.accepted = true
           } else if (
             event.key === Qt.Key_N
@@ -1609,7 +1663,7 @@ Item {
                     ? "Enter Set  Ctrl+Enter Append  ↑↓ Select\nTab Keywords  Shift+Tab Bookmarks"
                     : root.viewMode === 2
                       ? "Enter Set  Ctrl+Enter Append  ↑↓ Select\nTab Bookmarks  Shift+Tab Tags"
-                      : "Enter Open  Ctrl+C Copy  Ctrl+T Window  Ctrl+Tab Browser\nTab Tags  Ctrl+V Paste  Ctrl+I Import  Ctrl+N Add  Ctrl+E Edit  Delete"
+                      : "Enter Open  Ctrl+C Copy  Ctrl+T Window  Ctrl+Tab Browser\nTab Tags  Ctrl+V Paste  Ctrl+I Import  Ctrl+N Add  Ctrl+E Edit  Ctrl+, Web"
           textFormat: Text.PlainText
 
           color: store.error ? Color.urgent : Color.menu.text
@@ -1639,17 +1693,21 @@ Item {
           return store.normalizeUrl(value)
         }
 
+        webDetailsEnabled: root.networkEnrichmentEnabled
+
         onSubmitted: function(
           bookmarkId,
           title,
           url,
           tags,
-          keyword
+          keyword,
+          favicon
         ) {
-          root.saveEditor(bookmarkId, title, url, tags, keyword)
+          root.saveEditor(bookmarkId, title, url, tags, keyword, favicon)
         }
 
         onCanceled: root.refocusList()
+        onWebDetailsSettingsRequested: root.openNetworkSettings()
       }
 
       BookmarkImport {
@@ -1740,6 +1798,27 @@ Item {
         onCanceled: root.cancelMenuEntryDialog()
         onAddRequested: root.requestMenuEntryOperation("install")
         onRemoveRequested: root.requestMenuEntryOperation("remove")
+      }
+
+      NetworkEnrichmentDialog {
+        id: networkDialog
+
+        z: 30
+        anchors.fill: parent
+        opened: root.networkDialogOpen
+        webEnabled: root.networkEnrichmentEnabled
+        busy: networkSettingProcess.running
+        background: Color.menu.background
+        foreground: Color.menu.text
+        scrim: Util.alpha(Color.menu.background, 0.76)
+        selectedBackground: Color.menu.selectedBackground
+        selectedText: Color.menu.selectedText
+        fontFamily: Style.font.menuFamily
+
+        onCanceled: root.closeNetworkSettings()
+        onSettingRequested: function(enabled) {
+          root.requestNetworkSetting(enabled)
+        }
       }
     }
   }
