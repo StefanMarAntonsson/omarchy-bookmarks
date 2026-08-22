@@ -30,6 +30,7 @@ Item {
   readonly property int maxTags: 64
   readonly property int maxTagLength: 128
   readonly property int maxKeywordLength: 128
+  property int storeLoadDeadlineMs: 30000
 
   property var bookmarks: []
   property bool loaded: false
@@ -42,6 +43,7 @@ Item {
   property var activeSave: null
   property int pendingUsageOpens: 0
   property bool storeLoadResponseReceived: false
+  property bool storeLoadTimedOut: false
   property bool reloadPending: false
   property bool initializePending: false
   property bool storeLoadAttemptActive: false
@@ -424,6 +426,7 @@ Item {
       "store-load", root.dataPath
     ]
     root.storeLoadResponseReceived = false
+    root.storeLoadTimedOut = false
     root.storeLoadAttemptActive = true
     storeLoadProcess.running = true
   }
@@ -459,8 +462,13 @@ Item {
   function finishStoreLoadAttempt() {
     if (!root.storeLoadAttemptActive)
       return
+    storeLoadDeadline.stop()
     root.storeLoadAttemptActive = false
-    if (!root.storeLoadResponseReceived)
+    var timedOut = root.storeLoadTimedOut
+    root.storeLoadTimedOut = false
+    if (timedOut)
+      root.failLoad("Bounded store reader exceeded its deadline")
+    else if (!root.storeLoadResponseReceived)
       root.failLoad("Bounded store reader did not return a response")
     if (root.reloadPending) {
       root.reloadPending = false
@@ -760,7 +768,11 @@ Item {
     running: false
     command: ["true"]
 
-    onStarted: root.storeLoadResponseReceived = false
+    onStarted: {
+      root.storeLoadResponseReceived = false
+      root.storeLoadTimedOut = false
+      storeLoadDeadline.restart()
+    }
 
     stdout: SplitParser {
       onRead: function(data) {
@@ -847,6 +859,18 @@ Item {
     interval: 100
     repeat: false
     onTriggered: root.reload()
+  }
+
+  Timer {
+    id: storeLoadDeadline
+    interval: root.storeLoadDeadlineMs
+    repeat: false
+    onTriggered: {
+      if (root.storeLoadAttemptActive && storeLoadProcess.running) {
+        root.storeLoadTimedOut = true
+        storeLoadProcess.signal(9)
+      }
+    }
   }
 
   Process {

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "stefanmara.bookmarks",
   "name": "Bookmarks",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "author": "Stefan Mar Antonsson",
   "description": "Search, import, and manage URL bookmarks",
   "kinds": ["menu"],

@@ -609,6 +609,55 @@ class StoreLoadTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "more than 1"):
                     bookmark_helper.load_store(str(path))
 
+    def test_rejects_fifo_store_without_blocking(self):
+        document = b'{"version":3,"bookmarks":[]}\n'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bookmarks.json"
+            os.mkfifo(path)
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(PROJECT_ROOT / "bookmark_helper.py"),
+                    "store-load",
+                    str(path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2,
+                check=False,
+            )
+
+            stdin = mock.Mock(buffer=io.BytesIO(document))
+            with mock.patch.object(bookmark_helper.sys, "stdin", stdin):
+                with self.assertRaisesRegex(ValueError, "regular file"):
+                    bookmark_helper.save_store(str(path))
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                bookmark_helper.create_store_backup(str(path))
+
+        result = json.loads(process.stdout)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertFalse(result["ok"])
+        self.assertIn("regular file", result["error"])
+
+    def test_rejects_symlink_store_for_reads_writes_and_backups(self):
+        document = '{"version":3,"bookmarks":[]}\n'
+        stdin = mock.Mock(buffer=io.BytesIO(document.encode("utf-8")))
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.json"
+            target.write_text(document, encoding="utf-8")
+            path = Path(directory) / "bookmarks.json"
+            path.symlink_to(target)
+
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                bookmark_helper.load_store(str(path))
+            with mock.patch.object(bookmark_helper.sys, "stdin", stdin):
+                with self.assertRaisesRegex(ValueError, "regular file"):
+                    bookmark_helper.save_store(str(path))
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                bookmark_helper.create_store_backup(str(path))
+
+            self.assertEqual(target.read_text(encoding="utf-8"), document)
+
     def test_atomically_saves_a_bounded_store_from_stdin(self):
         document = json.dumps({
             "version": 3,
@@ -698,6 +747,10 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(len(backups), 3)
             self.assertFalse(created[0].exists())
             self.assertEqual(result["pruned"], 1)
+            self.assertEqual(
+                Path(result["backup"]).read_text(encoding="utf-8"),
+                "5",
+            )
             for backup in backups:
                 self.assertEqual(os.stat(backup).st_mode & 0o777, 0o600)
 
@@ -735,6 +788,29 @@ class MenuEntryTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "invalid network"):
                 bookmark_helper.read_settings(str(settings_path))
+
+    def test_rejects_fifo_settings_without_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            os.mkfifo(settings_path)
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(PROJECT_ROOT / "bookmark_helper.py"),
+                    "network-enrichment",
+                    "status",
+                    str(settings_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2,
+                check=False,
+            )
+
+        result = json.loads(process.stdout)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertFalse(result["ok"])
+        self.assertIn("regular file", result["error"])
 
     def test_rejects_oversized_settings_before_parsing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1179,6 +1255,8 @@ class QmlResidentLifecycleTests(unittest.TestCase):
         self.assertNotIn("storeLoadProcess.running = false", reload_function)
         self.assertIn("root.requestReload()", watcher)
         self.assertIn("id: reloadDebounce", source)
+        self.assertIn("id: storeLoadDeadline", source)
+        self.assertIn("storeLoadProcess.signal(9)", source)
 
     def test_failed_process_starts_release_busy_state(self):
         checks = {

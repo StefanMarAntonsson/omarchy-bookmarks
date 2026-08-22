@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import configparser
 from datetime import datetime
+import errno
 import html
 from html.parser import HTMLParser
 from http.client import HTTPConnection, HTTPSConnection, HTTPException
@@ -20,6 +21,7 @@ import signal
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -151,13 +153,71 @@ def run_bounded_process(
             input_stream.close()
 
 
-def read_limited_text(path: Path, limit: int, description: str) -> str:
-    """Read a UTF-8 text file without ever buffering more than limit bytes."""
-    with path.open("rb") as stream:
-        raw = stream.read(limit + 1)
+def read_limited_bytes(
+    path: Path,
+    limit: int,
+    description: str,
+    *,
+    follow_symlinks: bool = True,
+) -> bytes:
+    """Read one descriptor-validated regular file without blocking on special files."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if not follow_symlinks:
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise OSError("This platform cannot safely open fixed bookmark paths")
+        flags |= os.O_NOFOLLOW
+
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if not follow_symlinks and error.errno == errno.ELOOP:
+            raise ValueError(f"{description} path is not a regular file") from error
+        raise
+
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{description} path is not a regular file")
+        if info.st_size > limit:
+            raise ValueError(f"{description} is too large")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            raw = stream.read(limit + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
     if len(raw) > limit:
         raise ValueError(f"{description} is too large")
+    return raw
+
+
+def read_limited_text(
+    path: Path,
+    limit: int,
+    description: str,
+    *,
+    follow_symlinks: bool = True,
+) -> str:
+    """Read one bounded regular file as UTF-8 text."""
+    raw = read_limited_bytes(
+        path,
+        limit,
+        description,
+        follow_symlinks=follow_symlinks,
+    )
     return raw.decode("utf-8", errors="replace")
+
+
+def existing_regular_mode(path: Path, description: str, default: int) -> int:
+    """Return a fixed path's mode without following symlinks or special files."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return default
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{description} path is not a regular file")
+    return stat.S_IMODE(info.st_mode)
 
 
 def _strip_omarchy_jsonc(value: str) -> str:
@@ -389,6 +449,26 @@ def _atomic_write_text(path: Path, value: str, mode: int) -> None:
             pass
 
 
+def _atomic_write_bytes(path: Path, value: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=path.name + ".tmp-", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def manage_menu_entry(menu_path: str, install: bool) -> dict[str, Any]:
     """Add or remove only this plugin's marked block in the user menu JSONC."""
     requested = Path(menu_path).expanduser()
@@ -465,15 +545,20 @@ def menu_entry_present(menu_path: str) -> bool:
 def read_settings(settings_path: str) -> dict[str, Any]:
     """Read plugin-owned settings with network access defaulting to disabled."""
     path = Path(settings_path).expanduser()
-    if not path.exists():
+    try:
+        raw = read_limited_text(
+            path,
+            MAX_SETTINGS_BYTES,
+            "Bookmarks settings",
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
         return {
             "version": SETTINGS_VERSION,
             "menuEntry": "pending",
             "networkEnrichment": False,
         }
-    if not path.is_file():
-        raise ValueError("Bookmarks settings path is not a regular file")
-    data = json.loads(read_limited_text(path, MAX_SETTINGS_BYTES, "Bookmarks settings"))
+    data = json.loads(raw)
     if not isinstance(data, dict) or data.get("version") != SETTINGS_VERSION:
         raise ValueError("Bookmarks settings use an unsupported format")
     decision = data.get("menuEntry", "pending")
@@ -498,11 +583,9 @@ def write_settings(settings_path: str, settings: dict[str, Any]) -> None:
     if not isinstance(network_enrichment, bool):
         raise ValueError("Invalid network choice")
     path = Path(settings_path).expanduser()
-    if path.exists() and not path.is_file():
-        raise ValueError("Bookmarks settings path is not a regular file")
     if not path.parent.exists():
         path.parent.mkdir(parents=True, mode=0o700)
-    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    mode = existing_regular_mode(path, "Bookmarks settings", 0o600)
     value = json.dumps(
         {
             "version": SETTINGS_VERSION,
@@ -1075,9 +1158,15 @@ class BookmarkHTMLParser(HTMLParser):
 
 def read_store(path: str) -> list[dict[str, Any]]:
     store_path = Path(path)
-    if not store_path.exists():
+    try:
+        raw = read_limited_text(
+            store_path,
+            MAX_STORE_BYTES,
+            "Bookmarks store",
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
         return []
-    raw = read_limited_text(store_path, MAX_STORE_BYTES, "Bookmarks store")
     data = json.loads(raw)
     if isinstance(data, list):
         source = data
@@ -1129,9 +1218,7 @@ def save_store(path: str) -> dict[str, Any]:
         raise ValueError(f"Bookmarks store contains more than {MAX_BOOKMARKS} entries")
 
     destination = Path(path)
-    if destination.exists() and not destination.is_file():
-        raise ValueError("Bookmarks store path is not a regular file")
-    mode = destination.stat().st_mode & 0o777 if destination.exists() else 0o600
+    mode = existing_regular_mode(destination, "Bookmarks store", 0o600)
     _atomic_write_text(destination, text, mode)
     return {"ok": True}
 
@@ -1278,7 +1365,14 @@ def import_bookmarks(source_arg: str, store_path: str) -> dict[str, Any]:
 
 def create_store_backup(store_path: str, keep: int = BACKUP_LIMIT) -> dict[str, Any]:
     source = Path(store_path)
-    if not source.is_file():
+    try:
+        contents = read_limited_bytes(
+            source,
+            MAX_STORE_BYTES,
+            "Bookmarks store",
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
         return {"ok": True, "skipped": True, "backup": "", "pruned": 0}
 
     keep = max(1, int(keep))
@@ -1289,16 +1383,7 @@ def create_store_backup(store_path: str, keep: int = BACKUP_LIMIT) -> dict[str, 
         counter += 1
         destination = Path(str(source) + f".backup-{stamp}-{counter}")
 
-    temporary = destination.with_name(destination.name + f".tmp-{os.getpid()}")
-    try:
-        shutil.copy2(source, temporary)
-        temporary.chmod(0o600)
-        os.replace(temporary, destination)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    _atomic_write_bytes(destination, contents, 0o600)
 
     pattern = source.name + ".backup-*"
     backups = sorted(

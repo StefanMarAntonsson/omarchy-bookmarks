@@ -71,4 +71,24 @@ if command -v quickshell >/dev/null 2>&1 && [ -d /usr/share/omarchy/shell ]; the
     printf '%s\n' "$qml_failed_start_output"
     exit 1
   fi
+
+  qml_deadline_config="$qml_test_root/deadline-config"
+  mkdir -p "$qml_deadline_config"
+  cp tests/BookmarkStoreDeadlineTest.qml BookmarkStore.qml \
+    bookmark_store_init.sh "$qml_deadline_config/"
+  cp tests/HangingStoreHelper.py "$qml_deadline_config/bookmark_helper.py"
+  if ! qml_deadline_output=$(
+    HOME="$qml_test_root" XDG_DATA_HOME="$qml_test_root/deadline-data" \
+      timeout 10 quickshell --no-duplicate \
+      -p "$qml_deadline_config/BookmarkStoreDeadlineTest.qml" 2>&1
+  ); then
+    printf '%s\n' "$qml_deadline_output"
+    exit 1
+  fi
+  if printf '%s\n' "$qml_deadline_output" | grep -q BOOKMARK_STORE_DEADLINE_TEST_PASS; then
+    printf '%s\n' "Quickshell store-load deadline test: OK"
+  else
+    printf '%s\n' "$qml_deadline_output"
+    exit 1
+  fi
 fi
