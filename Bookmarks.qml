@@ -430,8 +430,33 @@ Item {
     }
   }
 
+  // Clips its content and, while active, scrolls overflowing content horizontally:
+  // hold for 1s, scroll to the end, hold for 1s, snap back to the start, and repeat.
+  component ScrollingClip: Item {
+    id: scrollingClip
+    property bool active: false
+    property real contentWidth: 0
+    property real offset: 0
+    readonly property real overflow: Math.max(0, contentWidth - width)
+    readonly property bool scrolling: active && overflow > 0
+    default property alias content: track.data
+    clip: true
+    onScrollingChanged: offset = 0
+
+    Item { id: track; x: -scrollingClip.offset; width: scrollingClip.contentWidth; height: parent.height }
+    SequentialAnimation {
+      running: scrollingClip.scrolling
+      loops: Animation.Infinite
+      PropertyAction { target: scrollingClip; property: "offset"; value: 0 }
+      PauseAnimation { duration: 1000 }
+      NumberAnimation { target: scrollingClip; property: "offset"; from: 0; to: scrollingClip.overflow; duration: Math.max(1, scrollingClip.overflow / Style.space(50) * 1000) }
+      PauseAnimation { duration: 1000 }
+    }
+  }
+
   component HighlightedText: Item {
     id: highlightedText
+    property bool scrollActive: false
     property string value: ""
     property string needle: ""
     property color foreground: Color.menu.text
@@ -475,21 +500,27 @@ Item {
       visible: false; text: "M"; textFormat: Text.PlainText
       font.family: highlightedText.fontFamily; font.pixelSize: highlightedText.fontPixelSize; font.weight: highlightedText.fontWeight
     }
-    Row {
-      anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom
-      Repeater {
-        model: highlightedText.segments
-        delegate: Rectangle {
-          required property var modelData
-          width: segmentText.implicitWidth; height: parent.height
-          radius: modelData.matched ? Math.max(1, Style.space(2)) : 0
-          color: modelData.matched ? highlightedText.matchedBackground : "transparent"
-          Text {
-            id: segmentText
-            anchors.centerIn: parent
-            text: modelData.value; textFormat: Text.PlainText
-            color: modelData.matched ? highlightedText.matchedForeground : highlightedText.foreground
-            font.family: highlightedText.fontFamily; font.pixelSize: highlightedText.fontPixelSize; font.weight: highlightedText.fontWeight
+    ScrollingClip {
+      anchors.fill: parent
+      active: highlightedText.scrollActive
+      contentWidth: segmentRow.implicitWidth
+      Row {
+        id: segmentRow
+        anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom
+        Repeater {
+          model: highlightedText.segments
+          delegate: Rectangle {
+            required property var modelData
+            width: segmentText.implicitWidth; height: parent.height
+            radius: modelData.matched ? Math.max(1, Style.space(2)) : 0
+            color: modelData.matched ? highlightedText.matchedBackground : "transparent"
+            Text {
+              id: segmentText
+              anchors.centerIn: parent
+              text: modelData.value; textFormat: Text.PlainText
+              color: modelData.matched ? highlightedText.matchedForeground : highlightedText.foreground
+              font.family: highlightedText.fontFamily; font.pixelSize: highlightedText.fontPixelSize; font.weight: highlightedText.fontWeight
+            }
           }
         }
       }
@@ -650,7 +681,14 @@ Item {
                 visible: !parent.showingShortcuts
                 anchors.left: parent.left; anchors.right: topShortcutHint.visible ? topShortcutHint.left : parent.right; anchors.verticalCenter: parent.verticalCenter
                 anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md; spacing: Style.spacing.xs
-                Text { width: parent.width; text: modelData.title || root.domain(modelData.originalUrl); textFormat: Text.PlainText; elide: Text.ElideRight; color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium }
+                ScrollingClip {
+                  id: topTitle
+                  width: parent.width; height: topTitleText.implicitHeight
+                  active: index === root.selectedIndex && parent.visible
+                  contentWidth: topTitleText.implicitWidth
+                  // Elide while at rest; show the full title once it starts moving.
+                  Text { id: topTitleText; width: topTitle.offset > 0 ? implicitWidth : topTitle.width; text: modelData.title || root.domain(modelData.originalUrl); textFormat: Text.PlainText; elide: Text.ElideRight; color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium }
+                }
                 Text { width: parent.width; text: root.domain(modelData.originalUrl) + ((modelData.tags || []).length ? "  ·  " + modelData.tags.slice(0, 3).join(" · ") : ""); textFormat: Text.PlainText; elide: Text.ElideRight; color: Color.menu.text; opacity: 0.52; font.family: Style.font.menuFamily; font.pixelSize: Style.font.bodySmall }
               }
               ResultShortcutContent {
@@ -688,6 +726,7 @@ Item {
                 anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md; spacing: Style.spacing.xs
                 HighlightedText {
                   width: parent.width
+                  scrollActive: index === root.selectedIndex && parent.visible
                   value: modelData.title || root.domain(modelData.originalUrl)
                   needle: root.query
                   foreground: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text
