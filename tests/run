@@ -6,8 +6,6 @@ project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_root"
 
 python3 -m unittest discover -s tests -p 'test_*.py'
-sh tests/test_store_init.sh
-python3 -m py_compile bookmark_helper.py
 
 if command -v cargo >/dev/null 2>&1; then
   cargo fmt --all -- --check
@@ -20,81 +18,5 @@ if command -v omarchy >/dev/null 2>&1; then
 fi
 
 if command -v qmllint >/dev/null 2>&1 && [ -d /usr/share/omarchy/shell ]; then
-  qmllint -I /usr/share/omarchy/shell \
-    Bookmarks.qml WorkerClient.qml BrowserPicker.qml MenuEntryDialog.qml NetworkEnrichmentDialog.qml \
-    BookmarkStore.qml BookmarkEditor.qml BookmarkImport.qml
-fi
-
-if command -v quickshell >/dev/null 2>&1 && [ -d /usr/share/omarchy/shell ]; then
-  qml_test_root=$(mktemp -d)
-  trap 'rm -rf -- "$qml_test_root"' EXIT HUP INT TERM
-  qml_test_config="$qml_test_root/config"
-  mkdir -p "$qml_test_config"
-  cp tests/BookmarkStoreTest.qml tests/BookmarkStoreResidentTest.qml BookmarkStore.qml \
-    bookmark_helper.py bookmark_store_init.sh "$qml_test_config/"
-  if ! qml_test_output=$(
-    HOME="$qml_test_root" XDG_DATA_HOME="$qml_test_root/data" \
-      timeout 30 quickshell --no-duplicate -p "$qml_test_config/BookmarkStoreTest.qml" \
-      2>&1
-  ); then
-    printf '%s\n' "$qml_test_output"
-    exit 1
-  fi
-  if printf '%s\n' "$qml_test_output" | grep -q BOOKMARK_STORE_TEST_PASS; then
-    printf '%s\n' "Quickshell persistence integration test: OK"
-  else
-    printf '%s\n' "$qml_test_output"
-    exit 1
-  fi
-
-  if ! qml_resident_output=$(
-    HOME="$qml_test_root" XDG_DATA_HOME="$qml_test_root/data" \
-      timeout 15 quickshell --no-duplicate -p "$qml_test_config/BookmarkStoreResidentTest.qml" \
-      2>&1
-  ); then
-    printf '%s\n' "$qml_resident_output"
-    exit 1
-  fi
-  if printf '%s\n' "$qml_resident_output" | grep -q BOOKMARK_STORE_RESIDENT_TEST_PASS; then
-    printf '%s\n' "Quickshell resident reload test: OK"
-  else
-    printf '%s\n' "$qml_resident_output"
-    exit 1
-  fi
-
-  if ! qml_failed_start_output=$(
-    HOME="$qml_test_root" XDG_DATA_HOME="$qml_test_root/data" \
-      PATH=/definitely-missing BOOKMARK_TEST_EXPECT_INIT_FAILURE=1 \
-      /usr/bin/timeout 15 /usr/bin/quickshell --no-duplicate \
-      -p "$qml_test_config/BookmarkStoreResidentTest.qml" 2>&1
-  ); then
-    printf '%s\n' "$qml_failed_start_output"
-    exit 1
-  fi
-  if printf '%s\n' "$qml_failed_start_output" | grep -q BOOKMARK_STORE_RESIDENT_TEST_PASS; then
-    printf '%s\n' "Quickshell failed-process recovery test: OK"
-  else
-    printf '%s\n' "$qml_failed_start_output"
-    exit 1
-  fi
-
-  qml_deadline_config="$qml_test_root/deadline-config"
-  mkdir -p "$qml_deadline_config"
-  cp tests/BookmarkStoreDeadlineTest.qml BookmarkStore.qml \
-    bookmark_store_init.sh "$qml_deadline_config/"
-  cp tests/HangingStoreHelper.py "$qml_deadline_config/bookmark_helper.py"
-  if ! qml_deadline_output=$(
-    HOME="$qml_test_root" XDG_DATA_HOME="$qml_test_root/deadline-data" \
-      timeout 10 quickshell --no-duplicate \
-      -p "$qml_deadline_config/BookmarkStoreDeadlineTest.qml" 2>&1
-  ); then
-    printf '%s\n' "$qml_deadline_output"
-    exit 1
-  fi
-  if printf '%s\n' "$qml_deadline_output" | grep -q BOOKMARK_STORE_DEADLINE_TEST_PASS; then
-    printf '%s\n' "Quickshell store-load deadline test: OK"
-  else
-    printf '%s\n' "$qml_deadline_output"
-    exit 1
-  fi
+  qmllint -I /usr/share/omarchy/shell Bookmarks.qml WorkerClient.qml
 fi

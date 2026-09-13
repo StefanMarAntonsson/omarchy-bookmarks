@@ -230,6 +230,31 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn("Math.min(10000", self.client)
         self.assertIn("Math.min(root.restartAttempt + 1, 6)", self.client)
 
+    def test_worker_failure_releases_ready_state_and_restarts(self):
+        self.assertIn("onExited", self.client)
+        self.assertIn("root.ready", self.client)
+        self.assertIn("restartTimer.restart()", self.client)
+
+    def test_process_output_is_streamed_not_collected(self):
+        for path in ROOT.glob("*.qml"):
+            with self.subTest(filename=path.name):
+                self.assertNotIn("StdioCollector", path.read_text(encoding="utf-8"))
+
+    def test_delete_requires_explicit_confirmation(self):
+        self.assertIn('mode = "delete"', self.ui)
+        self.assertIn('text: "Enter confirms · Escape cancels"', self.ui)
+        self.assertIn('type:"delete",bookmark_id:root.editingBookmark.id', self.ui)
+
+    def test_untrusted_titles_are_plain_text(self):
+        position = self.ui.index("text: modelData.title || root.domain(modelData.originalUrl)")
+        self.assertIn("textFormat: Text.PlainText", self.ui[position:position + 1000])
+
+    def test_hidden_overlay_releases_result_model(self):
+        self.assertIn(
+            'function close() { opened = false; query = ""; searchField.text = ""; results = []',
+            self.ui,
+        )
+
     def test_default_view_has_no_toolbar_or_buttons(self):
         search_start = self.ui.index("id: searchField")
         results_start = self.ui.index('visible: root.mode === "search" && root.query.trim().length > 0')

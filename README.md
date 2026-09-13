@@ -30,10 +30,6 @@ QML never reads SQLite, performs network requests, or scans the bookmark
 collection. Messages are limited to 64 KiB and responses to 256 KiB. Search
 returns at most ten bookmarks per page and loads further matches while scrolling.
 
-The old QML store, import/editor components, `bookmark_helper.py`, and
-`bookmark_store_init.sh` remain for compatibility and migration regression
-coverage. See `docs/existing-architecture.md` for the pre-migration baseline.
-
 ## Build and worker location
 
 Build the worker in the plugin checkout:
@@ -179,14 +175,14 @@ embeds no browser.
 
 - Legacy keyword data is preserved and searchable. Parameter substitution for
   `%s`, `%S`, and `{searchTerms}` is not yet exposed by the minimal UI.
-- The former full browser picker, HTML/JSON import dialog, menu-entry manager,
-  favicon pipeline, and network opt-in panel remain in the repository but are
-  not exposed in the minimal overlay. Alternate-browser launching is available
-  directly through the first nine `Ctrl+Alt+number` shortcuts.
-- Metadata fetching currently follows the HTTP client's normal network policy;
-  deployments requiring SSRF-resistant destination filtering should keep the
-  feature disabled at the network layer until the prior helper's address
-  pinning is ported.
+- There is no HTML/JSON import, Omarchy menu-entry installer, or favicon
+  support. The pre-worker implementation of these (Python helper and QML
+  components) was removed; it can be recovered from Git history before the
+  cleanup commit. Alternate-browser launching is available through the first
+  nine `Ctrl+Alt+number` shortcuts.
+- Metadata fetching currently follows the HTTP client's normal network policy
+  and does not reject private or loopback destinations. Keep page-detail
+  fetching disabled where SSRF-resistant destination filtering is required.
 - The release binary is built separately rather than committed to Git.
 
 ## Performance

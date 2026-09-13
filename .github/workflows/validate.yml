@@ -15,8 +15,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - name: Run portable tests
         run: |
           python3 -m unittest discover -s tests -p 'test_*.py'
-          sh tests/test_store_init.sh
-          python3 -m py_compile bookmark_helper.py
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
