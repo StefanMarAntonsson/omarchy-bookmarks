@@ -5,20 +5,16 @@ from __future__ import annotations
 
 import base64
 import configparser
-from datetime import datetime
 import errno
 import html
-from html.parser import HTMLParser
-from http.client import HTTPConnection, HTTPSConnection, HTTPException
 import ipaddress
 import json
 import math
 import os
-from pathlib import Path
 import re
 import selectors
-import signal
 import shutil
+import signal
 import socket
 import ssl
 import stat
@@ -26,9 +22,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
+from html.parser import HTMLParser
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
-
 
 MAX_HTML = 1_000_000
 MAX_ICON_INPUT = 256_000

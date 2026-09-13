@@ -1117,19 +1117,16 @@ MimeType=x-scheme-handler/https;
 
 
 class QmlSecurityTests(unittest.TestCase):
-    def test_paste_defaults_to_local_helper_and_opens_editor_before_saving(self):
+    def test_pasted_url_is_worker_checked_before_open_or_add(self):
         source = (PROJECT_ROOT / "Bookmarks.qml").read_text(encoding="utf-8")
-
         self.assertIn(
-            'root.networkEnrichmentEnabled ? "clipboard-enrich" : "clipboard"',
+            'type: "search", query: query, scope: searchScope, limit: resultCount',
             source,
         )
-        self.assertIn("clipboardCommand.push(root.menuPreferencePath)", source)
-        self.assertIn("editor.openForClipboard(result.item)", source)
-        quick_add_handler = source[
-            source.index("id: quickAddProcess"):source.index("id: copyProcess")
-        ]
-        self.assertNotIn("store.addBookmark", quick_add_handler)
+        self.assertIn('if (result.isUrl && !result.exactMatch && offset === 0)', source)
+        self.assertIn('action: "open_url"', source)
+        self.assertIn('type: "duplicate", url: candidate', source)
+        self.assertIn('type: "fetch_metadata"', source)
 
     def test_network_warning_is_plain_text_and_explains_the_risk(self):
         source = (PROJECT_ROOT / "NetworkEnrichmentDialog.qml").read_text(
@@ -1143,22 +1140,16 @@ class QmlSecurityTests(unittest.TestCase):
         self.assertIn("Enable anyway", source)
         self.assertGreaterEqual(source.count("textFormat: Text.PlainText"), 3)
 
-    def test_shared_delete_confirmation_never_receives_untrusted_text(self):
+    def test_delete_requires_explicit_confirmation(self):
         source = (PROJECT_ROOT / "Bookmarks.qml").read_text(encoding="utf-8")
-        confirm = source[
-            source.index("ConfirmDialog {"):source.index("MenuEntryDialog {")
-        ]
-
-        self.assertIn('message: "Delete the selected bookmark?"', confirm)
-        self.assertNotIn("deleteTarget", confirm)
-        self.assertNotIn("displayTitle", confirm)
+        self.assertIn('mode = "delete"', source)
+        self.assertIn('text: "Enter confirms · Escape cancels"', source)
+        self.assertIn('type:"delete",bookmark_id:root.editingBookmark.id', source)
 
     def test_untrusted_text_sinks_are_plain_text(self):
         checks = {
             "Bookmarks.qml": (
-                "text: root.currentQuery() || root.modePlaceholder()",
-                "? root.displayTitle(row.bookmark)",
-                '"Search for “" + root.keywordAction.terms',
+                "text: modelData.title || root.domain(modelData.originalUrl)",
             ),
             "BookmarkImport.qml": (
                 "text: modelData.title || modelData.url",
@@ -1179,27 +1170,25 @@ class QmlSecurityTests(unittest.TestCase):
                         "textFormat: Text.PlainText",
                         source[position:position + 1000],
                     )
+        bookmarks = (PROJECT_ROOT / "Bookmarks.qml").read_text(encoding="utf-8")
+        highlighted = bookmarks[
+            bookmarks.index("component HighlightedText: Item"):
+            bookmarks.index("WorkerClient {")
+        ]
+        self.assertGreaterEqual(highlighted.count("textFormat: Text.PlainText"), 2)
+        self.assertNotIn("Text.RichText", highlighted)
 
 
 class QmlResidentLifecycleTests(unittest.TestCase):
-    def test_hidden_menu_releases_derived_models_and_favicon_cache(self):
+    def test_hidden_overlay_releases_result_model(self):
         source = (PROJECT_ROOT / "Bookmarks.qml").read_text(encoding="utf-8")
-
-        for expression in (
-            "root.opened && root.viewMode === 0",
-            "? root.resolveKeywordAction(root.query)",
-            "? root.bookmarksForQuery(root.query)",
-            "root.opened && root.viewMode === 1 ? root.collectTags() : []",
-            "root.opened && root.viewMode === 2 ? root.collectKeywords() : []",
-            "!root.opened\n      ? []",
-        ):
-            self.assertIn(expression, source)
-        favicon = source[source.index("id: faviconImage"):]
-        self.assertIn("cache: false", favicon[:1000])
+        self.assertIn('function close() { opened = false; query = ""; searchField.text = ""; results = []', source)
+        self.assertIn("model: root.results", source)
+        self.assertNotIn("root.bookmarksForQuery", source)
 
     def test_large_helper_responses_are_not_retained_by_collectors(self):
         checks = {
-            "Bookmarks.qml": ("id: quickAddProcess", "id: copyProcess"),
+            "WorkerClient.qml": ("id: worker", "Timer { id: restartTimer"),
             "BookmarkStore.qml": ("id: storeLoadProcess", "id: storeSaveProcess"),
             "BookmarkImport.qml": ("id: importProcess", "Rectangle {"),
             "BrowserPicker.qml": ("id: browserProcess", "Rectangle {"),
@@ -1260,14 +1249,7 @@ class QmlResidentLifecycleTests(unittest.TestCase):
 
     def test_failed_process_starts_release_busy_state(self):
         checks = {
-            "Bookmarks.qml": (
-                "root.quickAdding",
-                "root.copyTargetTitle",
-                "root.menuStatusPending",
-                "root.menuEntryOperation",
-                "root.networkSettingOperation",
-                "root.fileDialogOpen",
-            ),
+            "WorkerClient.qml": ("root.ready", "restartTimer.restart()"),
             "BookmarkStore.qml": (
                 "root.initializePending",
                 "root.storeLoadAttemptActive",
@@ -1280,7 +1262,7 @@ class QmlResidentLifecycleTests(unittest.TestCase):
         for filename, guards in checks.items():
             source = (PROJECT_ROOT / filename).read_text(encoding="utf-8")
             with self.subTest(filename=filename):
-                self.assertIn("onRunningChanged", source)
+                self.assertTrue("onRunningChanged" in source or "onExited" in source)
                 for guard in guards:
                     self.assertIn(guard, source)
 

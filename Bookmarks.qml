@@ -1,1986 +1,832 @@
 import QtQuick
+import QtQuick.Controls as Controls
+import QtQml.Models
 import Quickshell
-import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 
 Item {
   id: root
-
+  property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property var shell: null
   property var manifest: null
   property bool opened: false
   property string query: ""
-  property int viewMode: 0
-  property string tagQuery: ""
-  property string keywordQuery: ""
-  property int selectedIndex: 0
-  property bool deleteConfirmOpen: false
-  property var deleteTarget: null
-  property bool fileDialogOpen: false
-  property bool quickAdding: false
-  property bool quickAddCanceled: false
+  property string searchScope: "all"
+  property string defaultSearchScope: "all"
+  property int resultCount: 5
+  property bool openInNewWindow: false
+  property bool fetchPageDetails: false
+  property string draftSearchScope: "all"
+  property int draftResultCount: 5
+  property bool draftOpenInNewWindow: false
+  property bool draftFetchPageDetails: false
+  property int settingsRequestId: 0
+  property int settingsSaveRequestId: 0
+  property var results: []
+  property var defaultResults: []
+  property int selectedIndex: -1
+  property int latestSearchId: 0
+  property bool searchLoading: false
+  property bool searchHasMore: false
+  property bool noResultsState: false
+  property int pendingSelectionIndex: -1
+  property bool previewingSelection: false
+  property bool editingPreviewUrl: false
+  property int openUrlRequestId: 0
+  property int addUrlRequestId: 0
+  property string pendingAddUrl: ""
+  property string mode: "search"
+  property var editingBookmark: null
   property string statusMessage: ""
-  property var browserTarget: null
-  property string copyTargetTitle: ""
-  property bool menuEntryDialogOpen: false
-  property bool menuEntryInstalled: false
-  property bool menuEntryStateReady: false
-  property bool menuPromptCheckedForOpen: false
-  property string menuEntryDecision: "pending"
-  property string menuEntryOperation: ""
-  property bool menuStatusPending: false
-  property bool networkEnrichmentEnabled: false
-  property bool networkSettingStateReady: false
-  property bool networkDialogOpen: false
-  property string networkSettingOperation: ""
-  property var quickAddResult: null
-  property string quickAddResponseError: ""
-  property var copyResponse: null
-  property var menuStatusResponse: null
-  property var menuEntryResponse: null
-  property var networkSettingResponse: null
-  property string importPickerPath: ""
+  property int metadataRequestId: 0
+  property bool titleEdited: false
+  property bool descriptionEdited: false
+  property bool applyingMetadata: false
+  property var suggestedTags: []
+  property bool controlHeld: false
+  property bool altHeld: false
+  property var browsers: []
+  property int browsersRequestId: 0
+  property bool browsersLoading: false
+  property string browsersError: ""
+  readonly property var alternateBrowsers: root.browsers.filter(function(browser) { return !browser.isDefault }).slice(0, 9)
+  readonly property real menuCornerRadius: Math.max(Style.cornerRadius, Style.space(12))
+  readonly property real contentCornerRadius: Math.max(1, root.menuCornerRadius - Math.max(1, Style.space(4)))
+  readonly property real resultWindowHeight: Style.space(58) * root.resultCount + Style.spacing.xs * (root.resultCount - 1)
+  readonly property real resultCountButtonWidth: Style.space(58)
+  readonly property int maximumResultCount: Math.min(10, Math.max(3, 2 + Math.floor((contentColumn.width + Style.spacing.sm) / (root.resultCountButtonWidth + Style.spacing.sm))))
+  readonly property string pluginId: (manifest && manifest.id) || "stefanmara.bookmarks"
+  readonly property string workerLauncher: localPath("worker-launcher.sh")
 
-  readonly property string helperPath:
-    root.localPath("bookmark_helper.py")
-
-  readonly property string menuExtensionPath:
-    Quickshell.env("HOME") + "/.config/omarchy/extensions/omarchy-menu.jsonc"
-
-  readonly property string menuPreferencePath:
-    store.dataDir + "/settings.json"
-
-  readonly property string pluginId:
-    manifest && manifest.id
-      ? String(manifest.id)
-      : "stefanmara.bookmarks"
-
-  readonly property int maxQuickAddOutputCharacters: 512 * 1024
-
-  readonly property var keywordAction:
-    root.opened && root.viewMode === 0
-      ? root.resolveKeywordAction(root.query)
-      : null
-
-  readonly property var filteredBookmarks:
-    root.opened && root.viewMode === 0
-      ? root.bookmarksForQuery(root.query)
-      : []
-
-  readonly property var allTags:
-    root.opened && root.viewMode === 1 ? root.collectTags() : []
-
-  readonly property var filteredTags:
-    root.opened && root.viewMode === 1 ? root.tagsForQuery(root.tagQuery) : []
-
-  readonly property var allKeywords:
-    root.opened && root.viewMode === 2 ? root.collectKeywords() : []
-
-  readonly property var filteredKeywords:
-    root.opened && root.viewMode === 2
-      ? root.keywordsForQuery(root.keywordQuery)
-      : []
-
-  readonly property var activeResults:
-    !root.opened
-      ? []
-      : root.viewMode === 1
-      ? root.filteredTags
-      : root.viewMode === 2
-        ? root.filteredKeywords
-        : root.filteredBookmarks
-
-  readonly property int activeTotal:
-    root.viewMode === 1
-      ? root.allTags.length
-      : root.viewMode === 2
-        ? root.allKeywords.length
-        : store.bookmarks.length
-
-  readonly property string viewName:
-    root.viewMode === 1
-      ? "Tags"
-      : root.viewMode === 2
-        ? "Keywords"
-        : "Bookmarks"
-
+  function isControlKey(event) {
+    var nativeKey = Number(event.nativeVirtualKey)
+    var scanCode = Number(event.nativeScanCode)
+    return event.key === Qt.Key_Control
+      || nativeKey === 0xffe3 || nativeKey === 0xffe4
+      || (event.key === Qt.Key_unknown
+        && (scanCode === 29 || scanCode === 37 || scanCode === 97 || scanCode === 105))
+  }
+  function isAltKey(event) {
+    var nativeKey = Number(event.nativeVirtualKey)
+    var scanCode = Number(event.nativeScanCode)
+    return event.key === Qt.Key_Alt
+      || nativeKey === 0xffe9 || nativeKey === 0xffea
+      || (event.key === Qt.Key_unknown
+        && (scanCode === 56 || scanCode === 64 || scanCode === 100 || scanCode === 108))
+  }
+  function updateModifierState(event, pressed) {
+    if (isControlKey(event)) controlHeld = pressed
+    else if (event.modifiers & Qt.ControlModifier) controlHeld = true
+    else if (!pressed) controlHeld = false
+    if (isAltKey(event)) altHeld = pressed
+    else if (event.modifiers & Qt.AltModifier) altHeld = true
+    else if (!pressed) altHeld = false
+  }
   function localPath(relativePath) {
-    var value = String(Qt.resolvedUrl(relativePath))
-    return value.indexOf("file://") === 0
-      ? decodeURIComponent(value.substring(7))
-      : value
+    var resolved = String(Qt.resolvedUrl(relativePath))
+    if (resolved.indexOf("file://") === 0) resolved = resolved.slice(7)
+    try { return decodeURIComponent(resolved) } catch (_) { return resolved }
   }
-
-  function parseSmallHelperResponse(data) {
-    var output = String(data || "")
-    if (output.length > 64 * 1024)
-      throw new Error("Helper returned too much data")
-    return JSON.parse(output)
-  }
-
-  function resolveKeywordAction(value) {
-    var input = String(value || "").trim()
-    var space = input.search(/\s/)
-    if (space < 1)
-      return null
-    var keyword = input.substring(0, space).toLowerCase()
-    var terms = input.substring(space).trim()
-    if (!terms)
-      return null
-    for (var i = 0; i < store.bookmarks.length; i++) {
-      var bookmark = store.bookmarks[i]
-      var template = String(bookmark.url || "")
-      if (String(bookmark.keyword || "").toLowerCase() === keyword
-          && (template.indexOf("%s") !== -1
-              || template.indexOf("%S") !== -1
-              || template.indexOf("{searchTerms}") !== -1)) {
-        return {bookmark: bookmark, terms: terms}
-      }
-    }
-    return null
-  }
-
-  function resolvedUrl(bookmark) {
-    if (!root.keywordAction || root.keywordAction.bookmark.id !== bookmark.id)
-      return bookmark.url
-    var terms = root.keywordAction.terms
-    var encoded = encodeURIComponent(terms)
-    return String(bookmark.url)
-      .replace(/%s/g, encoded)
-      .replace(/%S/g, terms)
-      .replace(/\{searchTerms\}/g, encoded)
-  }
-
-  function displayTitle(bookmark) {
-    var title = String(bookmark && bookmark.title || "").trim()
-    if (title)
-      return title
-    var match = String(bookmark && bookmark.url || "").match(/^https?:\/\/([^\/?#]+)/i)
-    return match ? match[1] : String(bookmark && bookmark.url || "")
-  }
-
-  function isParameterized(bookmark) {
-    var url = String(bookmark && bookmark.url || "")
-    return url.indexOf("%s") !== -1
-      || url.indexOf("%S") !== -1
-      || url.indexOf("{searchTerms}") !== -1
-  }
-
-  function collectTags() {
-    var byName = {}
-    var items = []
-
-    for (var i = 0; i < store.bookmarks.length; i++) {
-      var tags = store.bookmarks[i].tags || []
-      var seenOnBookmark = {}
-      for (var j = 0; j < tags.length; j++) {
-        var name = String(tags[j] || "").trim()
-        var key = name.toLowerCase()
-        if (!key || seenOnBookmark[key])
-          continue
-        seenOnBookmark[key] = true
-        if (byName[key]) {
-          byName[key].count += 1
-        } else {
-          var item = {tag: name, count: 1}
-          byName[key] = item
-          items.push(item)
-        }
-      }
-    }
-
-    items.sort(function(first, second) {
-      if (first.count !== second.count)
-        return second.count - first.count
-      return first.tag.toLowerCase().localeCompare(second.tag.toLowerCase())
-    })
-    return items
-  }
-
-  function tagsForQuery(value) {
-    var search = String(value || "").trim().toLowerCase()
-    if (!search)
-      return root.allTags
-
-    var prefix = []
-    var substring = []
-    for (var i = 0; i < root.allTags.length; i++) {
-      var item = root.allTags[i]
-      var tag = item.tag.toLowerCase()
-      if (tag.indexOf(search) === 0)
-        prefix.push(item)
-      else if (tag.indexOf(search) !== -1)
-        substring.push(item)
-    }
-    return prefix.concat(substring)
-  }
-
-  function collectKeywords() {
-    var seen = {}
-    var items = []
-
-    for (var i = 0; i < store.bookmarks.length; i++) {
-      var bookmark = store.bookmarks[i]
-      var keyword = String(bookmark.keyword || "").trim()
-      var key = keyword.toLowerCase()
-      if (!key || seen[key])
-        continue
-      seen[key] = true
-      items.push({
-        keyword: keyword,
-        bookmark: bookmark,
-        parameterized: root.isParameterized(bookmark)
-      })
-    }
-
-    items.sort(function(first, second) {
-      return first.keyword.toLowerCase().localeCompare(
-        second.keyword.toLowerCase()
-      )
-    })
-    return items
-  }
-
-  function keywordsForQuery(value) {
-    var search = String(value || "").trim().toLowerCase()
-    if (!search)
-      return root.allKeywords
-
-    var prefix = []
-    var substring = []
-    for (var i = 0; i < root.allKeywords.length; i++) {
-      var item = root.allKeywords[i]
-      var keyword = item.keyword.toLowerCase()
-      var searchable = (
-        item.keyword + " "
-        + root.displayTitle(item.bookmark) + " "
-        + item.bookmark.url
-      ).toLowerCase()
-      if (keyword.indexOf(search) === 0)
-        prefix.push(item)
-      else if (searchable.indexOf(search) !== -1)
-        substring.push(item)
-    }
-    return prefix.concat(substring)
-  }
-
-  function currentQuery() {
-    if (root.viewMode === 1)
-      return root.tagQuery
-    if (root.viewMode === 2)
-      return root.keywordQuery
-    return root.query
-  }
-
-  function setCurrentQuery(value) {
-    if (root.viewMode === 1)
-      root.tagQuery = value
-    else if (root.viewMode === 2)
-      root.keywordQuery = value
-    else
-      root.query = value
-  }
-
-  function modePlaceholder() {
-    if (root.viewMode === 1)
-      return "Search tags…"
-    if (root.viewMode === 2)
-      return "Search keywords…"
-    return "Search bookmarks…"
-  }
-
-  function cycleView(amount) {
-    root.viewMode = ((root.viewMode + amount) % 3 + 3) % 3
-    root.selectedIndex = 0
-    bookmarkList.positionViewAtBeginning()
-  }
-
-  function selectedResult() {
-    if (
-      root.selectedIndex < 0
-      || root.selectedIndex >= root.activeResults.length
-    ) {
-      return null
-    }
-    return root.activeResults[root.selectedIndex]
-  }
-
-  function applyPickerSelection(append) {
-    var item = root.selectedResult()
-    if (!item || root.viewMode === 0)
-      return
-
-    var token = root.viewMode === 1
-      ? "#" + item.tag
-      : item.keyword
-    var previous = root.query.trim()
-    root.query = append && previous
-      ? previous + " " + token
-      : token
-
-    if (!append && root.viewMode === 2 && item.parameterized)
-      root.query += " "
-
-    if (root.viewMode === 1)
-      root.tagQuery = ""
-    else
-      root.keywordQuery = ""
-    root.viewMode = 0
-    root.selectedIndex = 0
-    bookmarkList.positionViewAtBeginning()
-  }
-
-  function parseSearch(value) {
-    var input = String(value || "").trim().toLowerCase()
-    var source = input ? input.split(/\s+/) : []
-    var normalTokens = []
-    var tagTokens = []
-    for (var i = 0; i < source.length; i++) {
-      if (source[i].charAt(0) === "#")
-        tagTokens.push(source[i].substring(1))
-      else
-        normalTokens.push(source[i])
-    }
-    return {
-      normalTokens: normalTokens,
-      tagTokens: tagTokens,
-      normalSearch: normalTokens.join(" ")
-    }
-  }
-
-  function tagPrefixMatch(bookmark, prefix) {
-    for (var i = 0; i < bookmark.tags.length; i++) {
-      if (String(bookmark.tags[i]).toLowerCase().indexOf(prefix) === 0)
-        return true
-    }
-    return false
-  }
-
-  function searchRelevance(bookmark, search, tokens, tagTokens) {
-    var title = String(bookmark.title || "").toLowerCase()
-    var keyword = String(bookmark.keyword || "").toLowerCase()
-    var url = String(bookmark.url || "").toLowerCase()
-    var score = 0
-
-    if (search) {
-      if (keyword === search)
-        score += 500
-      if (title === search)
-        score += 450
-      else if (title.indexOf(search) === 0)
-        score += 300
-      if (keyword && keyword.indexOf(search) === 0)
-        score += 280
-      if (url.indexOf(search) !== -1)
-        score += 100
-    }
-
-    for (var i = 0; i < tokens.length; i++) {
-      if (title.indexOf(tokens[i]) === 0)
-        score += 30
-      else if (title.indexOf(tokens[i]) !== -1)
-        score += 20
-      if (keyword === tokens[i])
-        score += 25
-    }
-
-    for (var j = 0; j < tagTokens.length; j++) {
-      if (!tagTokens[j])
-        continue
-      for (var k = 0; k < bookmark.tags.length; k++) {
-        var tag = String(bookmark.tags[k]).toLowerCase()
-        if (tag === tagTokens[j]) {
-          score += 90
-          break
-        }
-        if (tag.indexOf(tagTokens[j]) === 0) {
-          score += 45
-          break
-        }
-      }
-    }
-    return score
-  }
-
-  function bookmarksForQuery(value) {
-    if (root.keywordAction)
-      return [root.keywordAction.bookmark]
-
-    var parsed = root.parseSearch(value)
-    var search = parsed.normalSearch
-    var tokens = parsed.normalTokens
-    var tagTokens = parsed.tagTokens
-    var now = Date.now()
-    var ranked = []
-
-    for (var i = 0; i < store.bookmarks.length; i++) {
-      var bookmark = store.bookmarks[i]
-      var searchable = (
-        String(bookmark.title || "") + " "
-        + bookmark.url + " "
-        + bookmark.tags.join(" ") + " "
-        + String(bookmark.keyword || "")
-      ).toLowerCase()
-      var matches = true
-
-      for (var j = 0; j < tokens.length; j++) {
-        if (searchable.indexOf(tokens[j]) === -1) {
-          matches = false
-          break
-        }
-      }
-      for (var k = 0; matches && k < tagTokens.length; k++) {
-        if (!root.tagPrefixMatch(bookmark, tagTokens[k]))
-          matches = false
-      }
-      if (!matches)
-        continue
-
-      ranked.push({
-        bookmark: bookmark,
-        relevance: search || tagTokens.length
-          ? root.searchRelevance(bookmark, search, tokens, tagTokens)
-          : 0,
-        usage: store.usageScoreAt(bookmark, now),
-        originalIndex: i
-      })
-    }
-
-    ranked.sort(function(first, second) {
-      if (first.relevance !== second.relevance)
-        return second.relevance - first.relevance
-      if (Math.abs(first.usage - second.usage) > 0.0000001)
-        return second.usage - first.usage
-      return first.originalIndex - second.originalIndex
-    })
-
-    var results = []
-    for (var resultIndex = 0; resultIndex < ranked.length; resultIndex++)
-      results.push(ranked[resultIndex].bookmark)
-    return results
-  }
-
-  onActiveResultsChanged: {
-    root.selectedIndex = Math.max(
-      0,
-      Math.min(
-        root.selectedIndex,
-        root.activeResults.length - 1
-      )
-    )
-  }
-
   function open(payloadJson) {
-    root.query = ""
-    root.viewMode = 0
-    root.tagQuery = ""
-    root.keywordQuery = ""
-    root.selectedIndex = 0
-    root.deleteConfirmOpen = false
-    root.deleteTarget = null
-    root.fileDialogOpen = false
-    root.statusMessage = ""
-    root.quickAddCanceled = quickAddProcess.running
-    root.browserTarget = null
-    root.copyTargetTitle = ""
-    root.menuEntryDialogOpen = false
-    root.networkDialogOpen = false
-    root.menuPromptCheckedForOpen = false
-    editor.close()
-    importer.close()
-    browserPicker.close()
-    root.opened = true
-
-    root.maybeShowMenuConsent()
-    root.refocusList()
+    query = ""; searchField.text = ""; results = []; defaultResults = []; selectedIndex = -1; latestSearchId = 0; searchLoading = false; searchHasMore = false; noResultsState = false; pendingSelectionIndex = -1
+    previewingSelection = false; editingPreviewUrl = false; openUrlRequestId = 0; addUrlRequestId = 0; pendingAddUrl = ""
+    mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false; browsersError = ""; opened = true
+    worker.start()
+    requestSettings()
+    performSearch()
+    requestBrowsers()
+    Qt.callLater(function() { searchField.forceActiveFocus() })
   }
-
-  function close() {
-    statusTimer.stop()
-    if (importPickerProcess.running)
-      importPickerProcess.running = false
-    root.fileDialogOpen = false
-    if (quickAddProcess.running) {
-      root.quickAddCanceled = true
-      quickAddProcess.running = false
-    } else {
-      root.quickAdding = false
-    }
-    root.quickAddResult = null
-    root.quickAddResponseError = ""
-    root.opened = false
-    root.query = ""
-    root.viewMode = 0
-    root.tagQuery = ""
-    root.keywordQuery = ""
-    root.deleteConfirmOpen = false
-    root.deleteTarget = null
-    root.statusMessage = ""
-    root.browserTarget = null
-    root.copyTargetTitle = ""
-    root.menuEntryDialogOpen = false
-    root.networkDialogOpen = false
-    editor.close()
-    importer.close()
-    browserPicker.close()
+  function close() { opened = false; query = ""; searchField.text = ""; results = []; defaultResults = []; selectedIndex = -1; pendingSelectionIndex = -1; noResultsState = false; previewingSelection = false; editingPreviewUrl = false; openUrlRequestId = 0; addUrlRequestId = 0; pendingAddUrl = ""; mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false }
+  function dismiss() { close(); if (shell && typeof shell.hide === "function") shell.hide(pluginId) }
+  function performSearch() {
+    if (!query.trim()) { noResultsState = false; results = defaultResults }
+    selectedIndex = -1; pendingSelectionIndex = -1; searchHasMore = false; searchLoading = true
+    latestSearchId = worker.request({type: "search", query: query, scope: searchScope, limit: resultCount, offset: 0})
   }
-
-  function dismiss() {
-    root.close()
-
-    if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide(root.pluginId)
+  function loadNextSearchPage() {
+    if (!query.trim() || searchLoading || !searchHasMore) return
+    searchLoading = true
+    latestSearchId = worker.request({type: "search", query: query, scope: searchScope, limit: resultCount, offset: loadedBookmarkCount()})
   }
-
-  function selectedBookmark() {
-    if (root.viewMode !== 0)
-      return null
-
-    if (
-      root.selectedIndex < 0
-      || root.selectedIndex >= root.filteredBookmarks.length
-    ) {
-      return null
-    }
-
-    return root.filteredBookmarks[root.selectedIndex]
+  function requestSettings() {
+    var requestId = worker.request({type: "get_settings"})
+    if (requestId) settingsRequestId = requestId
   }
-
-  function refocusList() {
-    Qt.callLater(function() {
-      if (
-        root.opened
-        && !editor.opened
-        && !importer.opened
-        && !browserPicker.opened
-        && !root.menuEntryDialogOpen
-        && !root.networkDialogOpen
-        && !root.deleteConfirmOpen
-      ) {
-        keyCatcher.forceActiveFocus()
+  function applySettings(settings) {
+    if (!settings) return
+    defaultSearchScope = settings.defaultSearchScope === "tags" ? "tags" : "all"
+    resultCount = Math.max(3, Math.min(10, Number(settings.resultCount || 5)))
+    openInNewWindow = settings.openInNewWindow === true
+    fetchPageDetails = settings.fetchPageDetails === true
+  }
+  function beginSettings() {
+    draftSearchScope = defaultSearchScope
+    draftResultCount = resultCount
+    draftOpenInNewWindow = openInNewWindow
+    draftFetchPageDetails = fetchPageDetails
+    statusMessage = ""
+    mode = "settings"
+    Qt.callLater(function() { settingsKeyCatcher.forceActiveFocus() })
+  }
+  function saveSettings() {
+    statusMessage = "Saving settings…"
+    settingsSaveRequestId = worker.request({
+      type: "save_settings",
+      settings: {
+        defaultSearchScope: draftSearchScope,
+        resultCount: draftResultCount,
+        openInNewWindow: draftOpenInNewWindow,
+        fetchPageDetails: draftFetchPageDetails
       }
     })
+    if (!settingsSaveRequestId) statusMessage = worker.error || "Worker is unavailable"
   }
-
-  function selectBookmarkById(id) {
-    for (var i = 0; i < root.filteredBookmarks.length; i++) {
-      if (root.filteredBookmarks[i].id === id) {
-        root.selectedIndex = i
-        return
-      }
-    }
-
-    root.selectedIndex = 0
+  function requestBrowsers() {
+    var requestId = worker.request({type: "browsers"})
+    if (!requestId) return
+    browsersRequestId = requestId
+    browsersLoading = true
+    browsersError = ""
   }
-
-  function mutationAvailable(requireIdle) {
-    if (!store.canMutate) {
-      root.showStatus(
-        store.error || (store.loaded
-          ? "Bookmark storage is read-only"
-          : "Bookmarks are still loading…")
-      )
-      return false
-    }
-    if (requireIdle && store.saving) {
-      root.showStatus("Finishing the current save…")
-      return false
-    }
-    if (requireIdle && root.quickAdding) {
-      root.showStatus("Finishing the clipboard bookmark…")
-      return false
-    }
-    return true
+  function shortcutIndex(slot) {
+    return query.trim() ? searchResults.visibleStartIndex + slot : slot
   }
-
-  function beginAdd() {
-    if (!root.mutationAvailable(true))
+  function resultShortcutSlot(key) {
+    if (key >= Qt.Key_1 && key <= Qt.Key_9) return key - Qt.Key_1
+    return key === Qt.Key_0 ? 9 : -1
+  }
+  function resultShortcutKey(slot) { return slot === 9 ? "0" : String(slot + 1) }
+  function toggleSearchScope() {
+    restoreSearchQuery()
+    searchScope = searchScope === "all" ? "tags" : "all"
+    selectedIndex = -1; performSearch()
+  }
+  function selectedResult() { return selectedIndex >= 0 && selectedIndex < results.length ? results[selectedIndex] : null }
+  function loadedBookmarkCount() {
+    return results.reduce(function(count, item) { return count + (item.action ? 0 : 1) }, 0)
+  }
+  function looksLikeWebUrl(value) { return /^https?:\/\//i.test(String(value || "").trim()) }
+  function restoreSearchQuery() {
+    previewingSelection = false; editingPreviewUrl = false; selectedIndex = -1; pendingSelectionIndex = -1; addUrlRequestId = 0; pendingAddUrl = ""; statusMessage = ""
+    searchField.text = query
+    searchField.cursorPosition = searchField.text.length
+  }
+  function previewSelection(index) {
+    if (index < 0 || index >= results.length) return
+    selectedIndex = index
+    var item = results[index]
+    searchField.text = String(item.originalUrl || item.url || "")
+    var matchIndex = searchField.text.toLowerCase().indexOf(query.trim().toLowerCase())
+    if (!item.action && query.trim().length && matchIndex >= 0) searchField.select(matchIndex, matchIndex + query.trim().length)
+    else searchField.cursorPosition = searchField.text.length
+    previewingSelection = !item.action
+    editingPreviewUrl = false
+    statusMessage = ""
+  }
+  function moveSelection(delta) {
+    if (!results.length) return
+    if (delta > 0 && selectedIndex === results.length - 1 && searchHasMore) {
+      pendingSelectionIndex = results.length
+      loadNextSearchPage()
       return
-    root.deleteConfirmOpen = false
-    root.deleteTarget = null
-    editor.openForCreate()
+    }
+    var next = selectedIndex < 0 ? 0 : Math.max(0, Math.min(selectedIndex + delta, results.length - 1))
+    previewSelection(next)
+    searchResults.positionViewAtIndex(next, ListView.Contain)
   }
-
+  function moveTopSelection(delta) {
+    if (!results.length) return
+    selectedIndex = selectedIndex < 0
+      ? (delta > 0 ? 0 : results.length - 1)
+      : ((selectedIndex + delta) % results.length + results.length) % results.length
+  }
+  function activateIndex(index) {
+    if (index < 0 || index >= results.length) return
+    previewingSelection = false; editingPreviewUrl = false; selectedIndex = index; activateCurrent(false)
+  }
+  function requestOpenUrl(url, invertOpeningPreference, browserId) {
+    if (openUrlRequestId) return
+    statusMessage = ""
+    var useNewWindow = invertOpeningPreference ? !openInNewWindow : openInNewWindow
+    openUrlRequestId = worker.request({type: "open_url", url: String(url || "").trim(), new_window: browserId ? false : useNewWindow, browser_id: browserId ? String(browserId) : null})
+    if (!openUrlRequestId) statusMessage = worker.error || "Worker is unavailable"
+  }
+  function activateCurrent(invertOpeningPreference) {
+    if (editingPreviewUrl) { requestOpenUrl(searchField.text, invertOpeningPreference, null); return }
+    var item = selectedResult()
+    if (item) {
+      if (item.action === "open_url") requestOpenUrl(item.url, invertOpeningPreference, null)
+      else activateSelected(invertOpeningPreference)
+      return
+    }
+    if (looksLikeWebUrl(searchField.text)) requestOpenUrl(searchField.text, invertOpeningPreference, null)
+  }
+  function activateSelected(invertOpeningPreference) {
+    var item = selectedResult(); if (!item) return
+    if (item.action === "open_url") { requestOpenUrl(item.url, invertOpeningPreference, null); return }
+    var useNewWindow = invertOpeningPreference ? !openInNewWindow : openInNewWindow
+    worker.request({type: "open", bookmark_id: item.id, new_window: useNewWindow}); dismiss()
+  }
+  function activateCurrentInBrowser(browserId) {
+    if (editingPreviewUrl) { requestOpenUrl(searchField.text, false, browserId); return }
+    var item = selectedResult()
+    if (!item) {
+      if (looksLikeWebUrl(searchField.text)) requestOpenUrl(searchField.text, false, browserId)
+      return
+    }
+    if (item.action === "open_url") { requestOpenUrl(item.url, false, browserId); return }
+    if (item.action) return
+    worker.request({type: "open", bookmark_id: item.id, new_window: false, browser_id: String(browserId)}); dismiss()
+  }
+  function requestAddCurrentUrl() {
+    if (addUrlRequestId) return
+    var candidate = String(searchField.text || "").trim()
+    if (!editingPreviewUrl && !looksLikeWebUrl(candidate)) { beginAdd(""); return }
+    pendingAddUrl = candidate
+    addUrlRequestId = worker.request({type: "duplicate", url: candidate})
+    if (!addUrlRequestId) statusMessage = worker.error || "Worker is unavailable"
+  }
+  function beginAdd(url) {
+    editingBookmark = null; mode = "form"; applyingMetadata = true
+    urlField.text = url || ""; titleField.text = ""; descriptionField.text = ""; tagsField.text = ""
+    applyingMetadata = false; titleEdited = false; descriptionEdited = false; suggestedTags = []; statusMessage = ""
+    Qt.callLater(function() { (url ? titleField : urlField).forceActiveFocus() })
+    if (url && fetchPageDetails) { metadataRequestId++; worker.request({type: "fetch_metadata", url: url, metadata_request_id: metadataRequestId}) }
+  }
   function beginEdit() {
-    if (!root.mutationAvailable(true))
-      return
-    var bookmark = root.selectedBookmark()
-
-    if (bookmark) {
-      editor.openForEdit(bookmark)
+    var item = selectedResult(); if (!item || item.action) return
+    editingBookmark = item; mode = "form"; applyingMetadata = true
+    urlField.text = item.originalUrl; titleField.text = item.title; descriptionField.text = item.description || ""
+    tagsField.text = (item.tags || []).join(", "); applyingMetadata = false
+    titleEdited = true; descriptionEdited = true; suggestedTags = []; statusMessage = ""
+    Qt.callLater(function() { titleField.forceActiveFocus(); titleField.selectAll() })
+  }
+  function saveForm() {
+    var tags = tagsField.text.split(",").map(function(value) { return value.trim() }).filter(Boolean)
+    var bookmark = {id: editingBookmark ? editingBookmark.id : "", url: urlField.text, title: titleField.text,
+      description: descriptionField.text, tags: tags, keyword: editingBookmark ? (editingBookmark.keyword || "") : ""}
+    if (!worker.request({type: editingBookmark ? "edit" : "add", bookmark: bookmark})) statusMessage = worker.error || "Worker is unavailable"
+  }
+  function cancelSecondary() { mode = "search"; editingBookmark = null; statusMessage = ""; Qt.callLater(function() { searchField.forceActiveFocus() }) }
+  function requestDelete() { var item = selectedResult(); if (item && !item.action) { editingBookmark = item; mode = "delete"; Qt.callLater(function(){ deleteKeyCatcher.forceActiveFocus() }) } }
+  function domain(url) { var match = String(url || "").match(/^https?:\/\/([^/]+)(\/.*)?$/i); return match ? match[1] + ((match[2] && match[2] !== "/") ? match[2] : "") : String(url || "") }
+  function handleMessage(response) {
+    if (!response.ok) {
+      if (openUrlRequestId && response.id === openUrlRequestId) { openUrlRequestId = 0; statusMessage = String(response.error || "Could not open URL"); return }
+      if (addUrlRequestId && response.id === addUrlRequestId) { addUrlRequestId = 0; pendingAddUrl = ""; statusMessage = String(response.error || "Enter a valid HTTP or HTTPS URL"); return }
+      if (response.id === settingsRequestId || response.id === settingsSaveRequestId) { statusMessage = String(response.error || "Could not load settings"); return }
+      if (response.id === browsersRequestId) { browsersLoading = false; browsersError = String(response.error || "Could not find browsers"); return }
+      if (response.id === latestSearchId) { searchLoading = false; results = []; noResultsState = false }
+      statusMessage = String(response.error || "Bookmark operation failed"); return
     }
-  }
-
-  function saveEditor(
-    bookmarkId,
-    title,
-    url,
-    tags,
-    keyword,
-    favicon
-  ) {
-    if (!root.mutationAvailable(false)) {
-      editor.validationError = store.error || "Bookmark storage is not writable"
-      return
+    var result = response.result || {}
+    if (openUrlRequestId && response.id === openUrlRequestId) { openUrlRequestId = 0; dismiss(); return }
+    if (addUrlRequestId && response.id === addUrlRequestId) {
+      var urlToAdd = pendingAddUrl
+      addUrlRequestId = 0; pendingAddUrl = ""
+      if (result.bookmark) { statusMessage = "Already bookmarked"; return }
+      restoreSearchQuery()
+      beginAdd(urlToAdd); return
     }
-    var selectedId = bookmarkId
-    var saved = false
-
-    if (bookmarkId) {
-      saved = store.updateBookmark(bookmarkId, title, url, tags, keyword)
-    } else {
-      selectedId = store.addBookmark(title, url, tags, keyword, favicon)
-      saved = Boolean(selectedId)
-    }
-
-    if (!saved) {
-      editor.validationError = store.error || "Could not save that bookmark"
-      return
-    }
-
-    editor.close()
-    root.viewMode = 0
-    root.query = ""
-    root.selectBookmarkById(selectedId)
-    root.refocusList()
-  }
-
-  function requestDelete() {
-    if (!root.mutationAvailable(true))
-      return
-    var bookmark = root.selectedBookmark()
-
-    if (!bookmark)
-      return
-
-    root.deleteTarget = bookmark
-    root.deleteConfirmOpen = true
-    deleteConfirm.selectedIndex = 1
-  }
-
-  function cancelDelete() {
-    root.deleteConfirmOpen = false
-    root.deleteTarget = null
-    root.refocusList()
-  }
-
-  function confirmDelete() {
-    var bookmark = root.deleteTarget
-
-    root.deleteConfirmOpen = false
-    root.deleteTarget = null
-
-    if (bookmark && !store.removeBookmark(bookmark.id))
-      root.showStatus(store.error || "Could not delete that bookmark")
-
-    root.refocusList()
-  }
-
-  function moveSelection(amount) {
-    var count = root.activeResults.length
-
-    if (!count)
-      return
-
-    root.selectedIndex =
-      ((root.selectedIndex + amount) % count + count) % count
-
-    bookmarkList.positionViewAtIndex(
-      root.selectedIndex,
-      ListView.Contain
-    )
-  }
-
-  function activateSelected(openInNewWindow) {
-    var bookmark = root.selectedBookmark()
-
-    if (!bookmark)
-      return
-
-    root.activateBookmark(bookmark, openInNewWindow, null)
-  }
-
-  function activateBookmark(bookmark, openInNewWindow, browser) {
-    if (!bookmark)
-      return
-
-    var url = root.resolvedUrl(bookmark)
-    var command
-
-    if (browser && browser.desktopPath) {
-      command = [
-        "systemd-run",
-        "--user",
-        "--quiet",
-        "--collect",
-        "--unit=omarchy-bookmark-browser-" + Date.now(),
-        "--property=StandardOutput=null",
-        "--property=StandardError=null",
-        "uwsm-app",
-        "--",
-        "gio",
-        "launch",
-        String(browser.desktopPath),
-        url
-      ]
-    } else {
-      command = ["omarchy-launch-browser"]
-      if (openInNewWindow)
-        command.push("--new-window")
-      command.push(url)
-    }
-
-    Quickshell.execDetached(command)
-    store.recordOpen(bookmark.id)
-
-    root.dismiss()
-  }
-
-  function openBrowserPicker() {
-    var bookmark = root.selectedBookmark()
-    if (!bookmark)
-      return
-    root.browserTarget = bookmark
-    browserPicker.openFor(root.displayTitle(bookmark))
-  }
-
-  function activateCurrent(openInNewWindow, append) {
-    if (root.viewMode === 0)
-      root.activateSelected(openInNewWindow)
-    else
-      root.applyPickerSelection(append)
-  }
-
-  function showStatus(message) {
-    root.statusMessage = message
-    statusTimer.restart()
-  }
-
-  function copySelectedUrl() {
-    var bookmark = root.selectedBookmark()
-    if (!bookmark || copyProcess.running)
-      return
-    root.copyTargetTitle = root.displayTitle(bookmark)
-    copyProcess.command = [
-      "python3", root.helperPath, "copy", root.resolvedUrl(bookmark)
-    ]
-    copyProcess.running = true
-  }
-
-  function refreshMenuEntryStatus() {
-    if (!store.storageReady || menuStatusProcess.running)
-      return
-    root.menuStatusPending = true
-    menuStatusProcess.command = [
-      "python3", root.helperPath,
-      "menu-entry", "status",
-      root.menuExtensionPath, root.menuPreferencePath
-    ]
-    menuStatusProcess.running = true
-  }
-
-  function maybeShowMenuConsent() {
-    if (!root.opened
-        || !root.menuEntryStateReady
-        || root.menuPromptCheckedForOpen) {
+    if (response.id === settingsRequestId) {
+      var previousScope = searchScope
+      var previousCount = resultCount
+      applySettings(result.settings)
+      if (mode === "settings") {
+        draftSearchScope = defaultSearchScope
+        draftResultCount = resultCount
+        draftOpenInNewWindow = openInNewWindow
+        draftFetchPageDetails = fetchPageDetails
+      }
+      if (mode === "search") {
+        searchScope = defaultSearchScope
+        if (previousScope !== searchScope || previousCount !== resultCount) performSearch()
+      }
       return
     }
-    root.menuPromptCheckedForOpen = true
-    if (!root.menuEntryInstalled
-        && (root.menuEntryDecision === "pending"
-            || root.menuEntryDecision === "installed")) {
-      menuEntryDialog.errorMessage = ""
-      menuEntryDialog.selectedIndex = 1
-      root.menuEntryDialogOpen = true
-    }
-  }
-
-  function openMenuEntryManager() {
-    if (!root.menuEntryStateReady) {
-      root.showStatus("Main-menu status is still loading…")
+    if (response.id === settingsSaveRequestId) {
+      applySettings(result.settings)
+      searchScope = defaultSearchScope
+      mode = "search"
+      statusMessage = ""
+      restoreSearchQuery()
+      performSearch()
+      Qt.callLater(function() { searchField.forceActiveFocus() })
       return
     }
-    menuEntryDialog.errorMessage = ""
-    menuEntryDialog.selectedIndex = root.menuEntryInstalled ? 0 : 1
-    root.menuEntryDialogOpen = true
-  }
-
-  function cancelMenuEntryDialog() {
-    if (!root.menuEntryInstalled) {
-      root.requestMenuEntryOperation("dismiss")
-      return
+    if (response.id === browsersRequestId) {
+      browsers = Array.isArray(result.browsers) ? result.browsers : []
+      browsersLoading = false; browsersError = ""; return
     }
-    root.menuEntryDialogOpen = false
-    root.refocusList()
-  }
-
-  function requestMenuEntryOperation(operation) {
-    if (menuEntryProcess.running)
-      return
-    root.menuEntryOperation = operation
-    menuEntryDialog.errorMessage = ""
-    menuEntryProcess.command = [
-      "python3", root.helperPath,
-      "menu-entry", operation,
-      root.menuExtensionPath, root.menuPreferencePath
-    ]
-    menuEntryProcess.running = true
-  }
-
-  function quickAddFromClipboard() {
-    if (root.quickAdding || !root.mutationAvailable(true))
-      return
-    root.quickAdding = true
-    root.quickAddCanceled = false
-    root.showStatus(
-      root.networkEnrichmentEnabled
-        ? "Reading clipboard and fetching optional web details…"
-        : "Reading clipboard…"
-    )
-    var clipboardCommand = [
-      "python3",
-      root.helperPath,
-      root.networkEnrichmentEnabled ? "clipboard-enrich" : "clipboard",
-      store.dataPath
-    ]
-    if (root.networkEnrichmentEnabled)
-      clipboardCommand.push(root.menuPreferencePath)
-    quickAddProcess.command = clipboardCommand
-    quickAddProcess.running = false
-    quickAddProcess.running = true
-  }
-
-  function openNetworkSettings() {
-    if (!root.networkSettingStateReady) {
-      root.showStatus("Web-details preference is still loading…")
-      return
-    }
-    networkDialog.errorMessage = ""
-    networkDialog.selectedIndex = 0
-    root.networkDialogOpen = true
-  }
-
-  function closeNetworkSettings() {
-    root.networkDialogOpen = false
-    if (editor.opened)
-      editor.refocus()
-    else
-      root.refocusList()
-  }
-
-  function requestNetworkSetting(enabled) {
-    if (networkSettingProcess.running)
-      return
-    root.networkSettingOperation = enabled ? "enable" : "disable"
-    networkDialog.errorMessage = ""
-    networkSettingProcess.command = [
-      "python3", root.helperPath,
-      "network-enrichment", root.networkSettingOperation,
-      root.menuPreferencePath
-    ]
-    networkSettingProcess.running = true
-  }
-
-  function openImportPicker() {
-    if (!root.mutationAvailable(true))
-      return
-    root.fileDialogOpen = true
-    importPickerProcess.command = [
-      "zenity",
-      "--file-selection",
-      "--title=Import bookmarks",
-      "--filename=" + Quickshell.env("HOME") + "/",
-      "--file-filter=Bookmark files | *.html *.htm *.json",
-      "--file-filter=All files | *"
-    ]
-    importPickerProcess.running = false
-    importPickerProcess.running = true
-  }
-
-  function finishImport(items) {
-    var outcome = store.importBookmarks(items)
-    if (outcome.blocked) {
-      root.showStatus(store.error || "Bookmark storage is not writable")
-      root.refocusList()
-      return
-    }
-    root.viewMode = 0
-    root.query = ""
-    root.selectedIndex = 0
-    if (outcome.added || outcome.updated) {
-      root.showStatus(
-        "Imported " + outcome.added + " new · updated " + outcome.updated
-        + " · backup created"
-      )
-    } else {
-      root.showStatus("Nothing changed · every URL was already saved")
-    }
-    root.refocusList()
-  }
-
-  Timer {
-    id: statusTimer
-    interval: 5000
-    repeat: false
-    onTriggered: root.statusMessage = ""
-  }
-
-  Process {
-    id: quickAddProcess
-    running: false
-    command: ["true"]
-
-    onStarted: {
-      root.quickAddResult = null
-      root.quickAddResponseError = ""
-    }
-
-    stdout: SplitParser {
-      onRead: function(data) {
-        try {
-          var output = String(data || "")
-          if (output.length > root.maxQuickAddOutputCharacters)
-            throw new Error("Clipboard helper returned too much data")
-          root.quickAddResult = JSON.parse(output)
-        } catch (exception) {
-          root.quickAddResponseError = String(
-            exception.message || "Could not add clipboard bookmark"
-          )
+    if (response.id === latestSearchId) {
+      if (String(result.query || "") !== query || String(result.scope || "all") !== searchScope) return
+      var offset = Number(result.offset || 0)
+      var next = Array.isArray(result.items) ? result.items : []
+      var displacedBookmark = false
+      if (result.isUrl && !result.exactMatch && offset === 0) {
+        next.unshift({action: "open_url", title: "Open URL", originalUrl: query, url: query, tags: []})
+        if (next.length > resultCount) { next.pop(); displacedBookmark = true }
+      }
+      if (offset === 0) {
+        noResultsState = query.trim().length > 0 && next.length === 0
+      }
+      results = offset === 0 ? next : results.concat(next); searchHasMore = Boolean(result.hasMore) || displacedBookmark; searchLoading = false
+      if (offset === 0 && !query.trim()) defaultResults = next
+      if (offset === 0) selectedIndex = result.isUrl && next.length ? 0 : -1
+      if (pendingSelectionIndex >= 0) {
+        var pending = Math.min(pendingSelectionIndex, results.length - 1)
+        pendingSelectionIndex = -1
+        if (pending >= 0) {
+          previewSelection(pending)
+          Qt.callLater(function() { searchResults.positionViewAtIndex(pending, ListView.Contain) })
         }
       }
+      return
     }
-
-    onExited: function(exitCode) {
-      root.quickAdding = false
-      if (root.quickAddCanceled) {
-        root.quickAddCanceled = false
-        root.quickAddResult = null
-        root.quickAddResponseError = ""
-        return
-      }
-      var result = root.quickAddResult
-      var responseError = root.quickAddResponseError
-      root.quickAddResult = null
-      root.quickAddResponseError = ""
-      if (result) {
-        if (exitCode !== 0 || !result.ok) {
-          root.showStatus(String(result.error || "Could not add clipboard bookmark"))
-        } else if (result.duplicate) {
-          root.viewMode = 0
-          root.query = ""
-          root.selectBookmarkById(result.id)
-          root.showStatus("That URL is already bookmarked")
-        } else {
-          editor.openForClipboard(result.item)
-        }
-      } else {
-        root.showStatus(responseError || "Could not add clipboard bookmark")
-      }
-      root.refocusList()
+    if (result.metadataRequestId !== undefined) {
+      if (Number(result.metadataRequestId) !== metadataRequestId || mode !== "form") return
+      applyingMetadata = true
+      if (!titleEdited && result.metadata && result.metadata.title) titleField.text = result.metadata.title
+      if (!descriptionEdited && result.metadata && result.metadata.description) descriptionField.text = result.metadata.description
+      applyingMetadata = false; worker.request({type: "suggest_tags", text: titleField.text + " " + descriptionField.text}); return
     }
-
-    onRunningChanged: {
-      if (!running && root.quickAdding) {
-        var canceled = root.quickAddCanceled
-        root.quickAdding = false
-        root.quickAddCanceled = false
-        root.quickAddResult = null
-        root.quickAddResponseError = ""
-        if (!canceled && root.opened) {
-          root.showStatus("Could not start the clipboard helper")
-          root.refocusList()
-        }
-      }
-    }
+    if (Array.isArray(result.tags) && mode === "form") { suggestedTags = result.tags.slice(0, 4); return }
+    if (result.bookmark && mode === "form") { previewingSelection = false; editingPreviewUrl = false; cancelSecondary(); query = result.bookmark.title || result.bookmark.originalUrl; searchField.text = query; searchDebounce.restart(); return }
+    if (result.deleted) { mode = "search"; editingBookmark = null; restoreSearchQuery(); performSearch() }
   }
 
-  Process {
-    id: copyProcess
-    running: false
-    command: ["true"]
+  component ResultShortcutContent: Item {
+    property var controller
 
-    onStarted: root.copyResponse = null
+    Row {
+      id: bookmarkActions
+      visible: !controller.altHeld
+      anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.spacing.md
 
-    stdout: SplitParser {
-      onRead: function(data) {
-        try {
-          root.copyResponse = root.parseSmallHelperResponse(data)
-        } catch (exception) {
-          root.copyResponse = {ok: false, error: "Could not copy URL"}
-        }
-      }
-    }
-
-    onExited: function(exitCode) {
-      var message = "Copied " + root.copyTargetTitle + " URL"
-      var result = root.copyResponse
-      root.copyResponse = null
-      if (!result || exitCode !== 0 || !result.ok)
-        message = String(result && result.error || "Could not copy URL")
-      root.copyTargetTitle = ""
-      if (root.opened) {
-        root.showStatus(message)
-        root.refocusList()
-      }
-    }
-
-    onRunningChanged: {
-      if (!running && root.copyTargetTitle) {
-        root.copyResponse = null
-        root.copyTargetTitle = ""
-        if (root.opened) {
-          root.showStatus("Could not start the clipboard helper")
-          root.refocusList()
-        }
-      }
-    }
-  }
-
-  Process {
-    id: menuStatusProcess
-    running: false
-    command: ["true"]
-
-    onStarted: root.menuStatusResponse = null
-
-    stdout: SplitParser {
-      onRead: function(data) {
-        try {
-          root.menuStatusResponse = root.parseSmallHelperResponse(data)
-        } catch (exception) {
-          root.menuStatusResponse = {
-            ok: false,
-            error: "Could not inspect main-menu entry"
+      Repeater {
+        model: [
+          {key: "Ctrl+T", label: controller.openInNewWindow ? "Open in new tab" : "Open in new window"},
+          {key: "Ctrl+C", label: "Copy URL"},
+          {key: "Ctrl+E", label: "Edit"}
+        ]
+        delegate: Column {
+          required property var modelData
+          width: (bookmarkActions.width - bookmarkActions.spacing * 2) / 3
+          spacing: Style.spacing.xs
+          Text {
+            width: parent.width; text: modelData.key; color: Color.menu.selectedText
+            font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium
+            elide: Text.ElideRight
+          }
+          Text {
+            width: parent.width; text: modelData.label; color: Color.menu.selectedText; opacity: 0.72
+            font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
           }
         }
       }
     }
 
-    onExited: function(exitCode) {
-      root.menuStatusPending = false
-      try {
-        var result = root.menuStatusResponse
-        root.menuStatusResponse = null
-        if (!result)
-          throw new Error("Could not inspect main-menu entry")
-        if (exitCode !== 0 || !result.ok)
-          throw new Error(String(result.error || "Could not inspect main-menu entry"))
-        root.menuEntryInstalled = Boolean(result.installed)
-        root.menuEntryDecision = String(result.decision || "pending")
-        root.menuEntryStateReady = true
-        root.networkEnrichmentEnabled = result.networkEnrichment === true
-        root.networkSettingStateReady = true
-        root.maybeShowMenuConsent()
-      } catch (exception) {
-        root.menuEntryStateReady = false
-        root.networkEnrichmentEnabled = false
-        root.networkSettingStateReady = false
-        if (root.opened) {
-          root.showStatus(
-            String(exception.message || "Could not inspect main-menu entry")
-          )
-        }
-      }
-    }
+    Row {
+      id: browserActions
+      visible: controller.altHeld && controller.alternateBrowsers.length > 0
+      anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.spacing.md
 
-    onRunningChanged: {
-      if (!running && root.menuStatusPending) {
-        root.menuStatusResponse = null
-        root.menuStatusPending = false
-        root.menuEntryStateReady = false
-        root.networkSettingStateReady = false
-        if (root.opened)
-          root.showStatus("Could not start the settings helper")
-      }
-    }
-  }
-
-  Process {
-    id: menuEntryProcess
-    running: false
-    command: ["true"]
-
-    onStarted: root.menuEntryResponse = null
-
-    stdout: SplitParser {
-      onRead: function(data) {
-        try {
-          root.menuEntryResponse = root.parseSmallHelperResponse(data)
-        } catch (exception) {
-          root.menuEntryResponse = {
-            ok: false,
-            error: "Could not update main-menu entry"
+      Repeater {
+        model: controller.alternateBrowsers
+        delegate: Column {
+          required property int index
+          required property var modelData
+          width: (browserActions.width - browserActions.spacing * (controller.alternateBrowsers.length - 1)) / controller.alternateBrowsers.length
+          spacing: Style.spacing.xs
+          Text {
+            width: parent.width; text: "Ctrl+Alt+" + (index + 1); color: Color.menu.selectedText
+            font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium
+            elide: Text.ElideRight
+          }
+          Text {
+            width: parent.width; text: modelData.name; textFormat: Text.PlainText
+            color: Color.menu.selectedText; opacity: 0.72
+            font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
           }
         }
       }
     }
 
-    onExited: function(exitCode) {
-      try {
-        var result = root.menuEntryResponse
-        root.menuEntryResponse = null
-        if (!result)
-          throw new Error("Could not update main-menu entry")
-        if (exitCode !== 0 || !result.ok)
-          throw new Error(String(result.error || "Could not update main-menu entry"))
-        root.menuEntryInstalled = Boolean(result.installed)
-        root.menuEntryDecision = String(result.decision || "dismissed")
-        root.menuEntryDialogOpen = false
-        if (root.opened) {
-          if (root.menuEntryOperation === "install")
-            root.showStatus("Added Bookmarks to the main Omarchy menu")
-          else if (root.menuEntryOperation === "remove")
-            root.showStatus("Removed Bookmarks from the main Omarchy menu")
-        }
-      } catch (exception) {
-        menuEntryDialog.errorMessage = String(
-          exception.message || "Could not update main-menu entry"
-        )
-      }
-      root.menuEntryOperation = ""
-      if (root.opened)
-        root.refocusList()
-    }
-
-    onRunningChanged: {
-      if (!running && root.menuEntryOperation) {
-        root.menuEntryResponse = null
-        root.menuEntryOperation = ""
-        menuEntryDialog.errorMessage = "Could not start the settings helper"
-      }
+    Text {
+      visible: controller.altHeld && controller.alternateBrowsers.length === 0
+      anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+      text: controller.browsersLoading ? "Finding alternate browsers…" : controller.browsersError ? controller.browsersError : "No alternate browsers configured"
+      color: controller.browsersError ? Color.urgent : Color.menu.selectedText
+      opacity: controller.browsersError ? 1 : 0.72
+      font.family: Style.font.menuFamily; font.pixelSize: Style.font.bodySmall
+      elide: Text.ElideRight
     }
   }
 
-  Process {
-    id: networkSettingProcess
-    running: false
-    command: ["true"]
+  component HighlightedText: Item {
+    id: highlightedText
+    property string value: ""
+    property string needle: ""
+    property color foreground: Color.menu.text
+    property color matchedForeground: Color.menu.selectedText
+    property color matchedBackground: Util.alpha(Color.menu.selectedText, 0.2)
+    property string fontFamily: Style.font.menuFamily
+    property int fontPixelSize: Style.font.bodySmall
+    property int fontWeight: Font.Normal
+    readonly property string trimmedNeedle: needle.trim()
+    readonly property var segments: splitMatches(value, trimmedNeedle)
+    implicitHeight: textMetrics.implicitHeight
+    clip: true
 
-    onStarted: root.networkSettingResponse = null
+    function splitMatches(sourceValue, searchValue) {
+      var source = String(sourceValue || "")
+      var search = String(searchValue || "")
+      if (!search.length) return [{value: source, matched: false}]
+      var sourceLower = source.toLowerCase()
+      var searchLower = search.toLowerCase()
+      var parts = []
+      var cursor = 0
+      var matchIndex = sourceLower.indexOf(searchLower, cursor)
+      while (matchIndex >= 0) {
+        if (matchIndex > cursor) appendPart(parts, source.slice(cursor, matchIndex), false)
+        appendPart(parts, source.slice(matchIndex, matchIndex + search.length), true)
+        cursor = matchIndex + search.length
+        matchIndex = sourceLower.indexOf(searchLower, cursor)
+      }
+      if (cursor < source.length) appendPart(parts, source.slice(cursor), false)
+      return parts.length ? parts : [{value: source, matched: false}]
+    }
+    function appendPart(parts, partValue, matched) {
+      if (!partValue.length) return
+      var previous = parts.length ? parts[parts.length - 1] : null
+      if (previous && previous.matched === matched) previous.value += partValue
+      else parts.push({value: partValue, matched: matched})
+    }
 
-    stdout: SplitParser {
-      onRead: function(data) {
-        try {
-          root.networkSettingResponse = root.parseSmallHelperResponse(data)
-        } catch (exception) {
-          root.networkSettingResponse = {
-            ok: false,
-            error: "Could not save web-details preference"
+    Text {
+      id: textMetrics
+      visible: false; text: "M"; textFormat: Text.PlainText
+      font.family: highlightedText.fontFamily; font.pixelSize: highlightedText.fontPixelSize; font.weight: highlightedText.fontWeight
+    }
+    Row {
+      anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom
+      Repeater {
+        model: highlightedText.segments
+        delegate: Rectangle {
+          required property var modelData
+          width: segmentText.implicitWidth; height: parent.height
+          radius: modelData.matched ? Math.max(1, Style.space(2)) : 0
+          color: modelData.matched ? highlightedText.matchedBackground : "transparent"
+          Text {
+            id: segmentText
+            anchors.centerIn: parent
+            text: modelData.value; textFormat: Text.PlainText
+            color: modelData.matched ? highlightedText.matchedForeground : highlightedText.foreground
+            font.family: highlightedText.fontFamily; font.pixelSize: highlightedText.fontPixelSize; font.weight: highlightedText.fontWeight
           }
         }
       }
     }
-
-    onExited: function(exitCode) {
-      try {
-        var result = root.networkSettingResponse
-        root.networkSettingResponse = null
-        if (!result)
-          throw new Error("Could not save web-details preference")
-        if (exitCode !== 0 || !result.ok)
-          throw new Error(String(result.error || "Could not save web-details preference"))
-        root.networkEnrichmentEnabled = result.enabled === true
-        root.networkSettingStateReady = true
-        root.networkDialogOpen = false
-        if (root.opened) {
-          root.showStatus(
-            root.networkEnrichmentEnabled
-              ? "Web details enabled for future pasted URLs"
-              : "Web details disabled · pasting will not access the network"
-          )
-          if (editor.opened)
-            editor.refocus()
-          else
-            root.refocusList()
-        }
-      } catch (exception) {
-        networkDialog.errorMessage = String(
-          exception.message || "Could not save web-details preference"
-        )
-      }
-      root.networkSettingOperation = ""
-    }
-
-    onRunningChanged: {
-      if (!running && root.networkSettingOperation) {
-        root.networkSettingResponse = null
-        root.networkSettingOperation = ""
-        networkDialog.errorMessage = "Could not start the settings helper"
-      }
-    }
   }
 
-  Process {
-    id: importPickerProcess
-    running: false
-    command: ["true"]
-
-    onStarted: root.importPickerPath = ""
-
-    stdout: SplitParser {
-      onRead: function(data) {
-        var path = String(data || "").trim()
-        root.importPickerPath = path.length <= 4096 ? path : ""
-      }
-    }
-
-    onExited: function(exitCode) {
-      root.fileDialogOpen = false
-      var path = root.importPickerPath
-      root.importPickerPath = ""
-      if (exitCode === 0 && path)
-        importer.begin(path)
-      else {
-        root.refocusList()
-      }
-    }
-
-    onRunningChanged: {
-      if (!running && root.fileDialogOpen) {
-        root.importPickerPath = ""
-        root.fileDialogOpen = false
-        if (root.opened) {
-          root.showStatus("Could not open import picker · install Zenity")
-          root.refocusList()
-        }
-      }
-    }
+  WorkerClient {
+    id: worker
+    launcherPath: root.workerLauncher
+    onReadyChanged: if (ready && root.opened) { root.requestSettings(); root.performSearch(); root.requestBrowsers() }
+    onMessage: function(response) { root.handleMessage(response) }
   }
-
-  BookmarkStore {
-    id: store
-    onStorageReadyChanged: {
-      if (storageReady)
-        root.refreshMenuEntryStatus()
-    }
-  }
+  Timer { id: searchDebounce; interval: 35; repeat: false; onTriggered: root.performSearch() }
 
   PanelWindow {
-    visible: root.opened && !root.fileDialogOpen
+    id: panel
+    visible: root.opened
     color: "transparent"
-
-    anchors {
-      top: true
-      bottom: true
-      left: true
-      right: true
-    }
-
+    anchors { top: true; bottom: true; left: true; right: true }
     exclusionMode: ExclusionMode.Ignore
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.namespace: "stefanmara-bookmarks"
-    WlrLayershell.keyboardFocus:
-      root.opened && !root.fileDialogOpen
-        ? WlrKeyboardFocus.Exclusive
-        : WlrKeyboardFocus.None
-
-    Rectangle {
-      anchors.fill: parent
-      color: Color.menu.scrim
-    }
-
-    MouseArea {
-      anchors.fill: parent
-      onClicked: root.dismiss()
-    }
+    WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+    Rectangle { anchors.fill: parent; color: Color.menu.scrim }
+    MouseArea { anchors.fill: parent; onClicked: root.dismiss() }
 
     BorderSurface {
       id: card
+      width: Math.min(Style.space(620), panel.width - Style.gapsOut * 2)
+      height: contentColumn.implicitHeight + Style.spacing.panelPadding * 2
+      // Pin the top where the collapsed card is centred so results grow downward only.
+      readonly property real collapsedHeight: searchField.height + Style.spacing.panelPadding * 2
+      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.top: parent.top
+      anchors.topMargin: Math.round(Math.max(Style.gapsOut, Math.min((panel.height - collapsedHeight) / 2, panel.height - height - Style.gapsOut)))
+      color: Color.menu.background; radius: root.menuCornerRadius; padding: Style.spacing.panelPadding
+      borderSpec: Border.surfaceSpec("menu", "border", Color.menu.border, Math.max(1, Style.space(1)))
+      Keys.priority: Keys.BeforeItem
+      Keys.onPressed: function(event) { root.updateModifierState(event, true) }
+      Keys.onReleased: function(event) { root.updateModifierState(event, false) }
+      MouseArea { anchors.fill: parent; onClicked: {} }
 
-      width: Math.min(
-        Style.space(560),
-        parent.width - Style.gapsOut * 2
-      )
-
-      height: Math.min(
-        parent.height * 0.8,
-        parent.height - Style.gapsOut * 2
-      )
-
-      anchors.centerIn: parent
-
-      color: Color.menu.background
-      borderSpec: Border.surfaceSpec(
-        "menu",
-        "border",
-        Color.menu.border,
-        Math.max(1, Style.space(2))
-      )
-
-      radius: Style.cornerRadius
-      padding: Style.spacing.panelPadding
-
-      MouseArea {
-        anchors.fill: parent
-        onClicked: {}
+      Instantiator {
+        model: root.alternateBrowsers
+        delegate: Shortcut {
+          required property int index
+          required property var modelData
+          sequence: "Ctrl+Alt+" + String(index + 1)
+          enabled: root.opened && root.mode === "search" && index < 9
+          autoRepeat: false
+          onActivated: root.activateCurrentInBrowser(modelData.id)
+        }
       }
 
-      Item {
-        id: keyCatcher
+      Shortcut {
+        sequence: "Ctrl+S"
+        enabled: root.opened && root.mode === "search"
+        autoRepeat: false
+        onActivated: root.beginSettings()
+      }
 
-        anchors.fill: parent
-        focus: true
-
-        Keys.priority: Keys.BeforeItem
-
-        Keys.onPressed: function(event) {
-          if (root.networkDialogOpen) {
-            if (networkDialog.handleKey(event))
-              event.accepted = true
-            return
-          }
-
-          if (root.menuEntryDialogOpen) {
-            if (menuEntryDialog.handleKey(event))
-              event.accepted = true
-            return
-          }
-
-          if (root.deleteConfirmOpen) {
-            if (deleteConfirm.handleKey(event))
-              event.accepted = true
-
-            return
-          }
-
-          if (browserPicker.opened) {
-            if (browserPicker.handleKey(event))
-              event.accepted = true
-            return
-          }
-
-          if (editor.opened || importer.opened)
-            return
-
-          if (
-            event.key === Qt.Key_Tab
-            && event.modifiers === Qt.ControlModifier
-            && root.viewMode === 0
-          ) {
-            root.openBrowserPicker()
-            event.accepted = true
-          } else if (
-            (
-              event.key === Qt.Key_Tab
-              && (
-                event.modifiers === Qt.NoModifier
-                || event.modifiers === Qt.ShiftModifier
-              )
-            )
-            || event.key === Qt.Key_Backtab
-          ) {
-            root.cycleView(
-              event.key === Qt.Key_Backtab
-                || event.modifiers === Qt.ShiftModifier
-                ? -1
-                : 1
-            )
-            event.accepted = true
-          } else if (
-            event.key === Qt.Key_C
-            && event.modifiers === Qt.ControlModifier
-            && root.viewMode === 0
-          ) {
-            root.copySelectedUrl()
-            event.accepted = true
-          } else if (
-            event.key === Qt.Key_V
-            && event.modifiers === Qt.ControlModifier
-          ) {
-            root.quickAddFromClipboard()
-            event.accepted = true
-          } else if (
-            event.key === Qt.Key_I
-            && event.modifiers === Qt.ControlModifier
-          ) {
-            root.openImportPicker()
-            event.accepted = true
-          } else if (
-            event.key === Qt.Key_M
-            && event.modifiers === Qt.ControlModifier
-          ) {
-            root.openMenuEntryManager()
-            event.accepted = true
-          } else if (
-            event.key === Qt.Key_Comma
-            && event.modifiers === Qt.ControlModifier
-          ) {
-            root.openNetworkSettings()
-            event.accepted = true
-          } else if (
-            event.key === Qt.Key_N
-            && event.modifiers === Qt.ControlModifier
-          ) {
-            root.beginAdd()
-            event.accepted = true
-          } else if (
-            event.key === Qt.Key_E
-            && event.modifiers === Qt.ControlModifier
-            && root.viewMode === 0
-          ) {
-            root.beginEdit()
-            event.accepted = true
-          } else if (
-            event.key === Qt.Key_T
-            && event.modifiers === Qt.ControlModifier
-            && root.viewMode === 0
-          ) {
-            root.activateSelected(true)
-            event.accepted = true
-          } else if (
-            event.key === Qt.Key_Delete
-            && root.viewMode === 0
-          ) {
-            root.requestDelete()
-            event.accepted = true
-          } else if (event.key === Qt.Key_Escape) {
-            if (root.currentQuery()) {
-              root.setCurrentQuery("")
-              root.selectedIndex = 0
-            } else if (root.viewMode !== 0) {
-              root.viewMode = 0
-              root.selectedIndex = 0
-            } else {
-              root.dismiss()
-            }
-
-            event.accepted = true
-          } else if (event.key === Qt.Key_Up) {
-            root.moveSelection(-1)
-            event.accepted = true
-          } else if (event.key === Qt.Key_Down) {
-            root.moveSelection(1)
-            event.accepted = true
-          } else if (
-            event.key === Qt.Key_Return
-            || event.key === Qt.Key_Enter
-          ) {
-            root.activateCurrent(
-              false,
-              root.viewMode !== 0
-                && (event.modifiers & Qt.ControlModifier) !== 0
-            )
-            event.accepted = true
-          } else if (Util.editsFilter(event, root.currentQuery())) {
-            root.setCurrentQuery(
-              Util.editedFilter(event, root.currentQuery())
-            )
-            root.selectedIndex = 0
-            event.accepted = true
-          } else if (
-            event.text
-            && event.text.length === 1
-            && event.text.charCodeAt(0) >= 32
-            && event.text.charCodeAt(0) !== 127
-            && (
-              event.modifiers === Qt.NoModifier
-              || event.modifiers === Qt.ShiftModifier
-            )
-          ) {
-            root.setCurrentQuery(root.currentQuery() + event.text)
-            root.selectedIndex = 0
-            event.accepted = true
-          }
-        }
+      Shortcut {
+        sequence: "Ctrl+Return"
+        enabled: root.opened && root.mode === "settings"
+        autoRepeat: false
+        onActivated: root.saveSettings()
       }
 
       Column {
-        anchors.fill: parent
-
-        anchors.topMargin: card.contentTopInset
-        anchors.rightMargin: card.contentRightInset
-        anchors.bottomMargin: card.contentBottomInset
-        anchors.leftMargin: card.contentLeftInset
-
-        spacing: Style.spacing.md
-
-        Item {
-          width: parent.width
-          height: Style.space(42)
-
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.IBeamCursor
-            onClicked: keyCatcher.forceActiveFocus()
+        id: contentColumn
+        anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+        anchors.leftMargin: card.contentLeftInset; anchors.rightMargin: card.contentRightInset; anchors.topMargin: card.contentTopInset
+        spacing: Style.spacing.xs
+        Controls.TextField {
+          id: searchField
+          visible: root.mode === "search"; width: parent.width; height: Style.space(46); text: root.query
+          leftPadding: Style.spacing.md; rightPadding: Style.spacing.md
+          placeholderText: root.controlHeld && !root.altHeld && text.length === 0 ? "" : root.searchScope === "tags" ? "Search tags" : "Search bookmarks"; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading
+          color: Color.menu.text; selectionColor: Util.alpha(Color.menu.selectedText, 0.24); selectedTextColor: Color.menu.text; selectByMouse: true
+          background: Rectangle {
+            color: Util.alpha(Color.menu.text, 0.035); radius: root.contentCornerRadius
+            border.color: root.searchScope === "tags" ? Util.alpha(Color.menu.selectedText, 0.62) : Util.alpha(Color.menu.text, 0.12)
+            Rectangle {
+              visible: root.searchScope === "tags"
+              anchors.fill: parent; anchors.margins: Style.space(3)
+              color: "transparent"; radius: Math.max(1, parent.radius - Style.space(3))
+              border.color: Util.alpha(Color.menu.selectedText, 0.42)
+            }
           }
-
           Text {
-            anchors.left: parent.left
-            anchors.right: countText.left
-            anchors.rightMargin: Style.spacing.md
-            anchors.verticalCenter: parent.verticalCenter
-
-            text: root.currentQuery() || root.modePlaceholder()
-            textFormat: Text.PlainText
+            visible: root.controlHeld && !root.altHeld && searchField.text.length === 0
+            anchors.centerIn: parent
+            text: "Ctrl+N   Add bookmark     Ctrl+S   Settings"
             color: Color.menu.text
-            opacity: root.currentQuery() ? 1 : 0.58
-
+            opacity: 0.72
             font.family: Style.font.menuFamily
-            font.pixelSize: Style.font.heading
-
-            elide: Text.ElideRight
+            font.pixelSize: Style.font.bodySmall
           }
-
-          Text {
-            id: countText
-
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-
-            text:
-              root.viewName
-              + " · "
-              + root.activeResults.length
-              + " / "
-              + root.activeTotal
-
-            color: Color.menu.text
-            opacity: 0.48
-
-            font.family: Style.font.menuFamily
-            font.pixelSize: Style.font.caption
+          Rectangle {
+            visible: root.previewingSelection || root.editingPreviewUrl
+            anchors.left: parent.left; anchors.leftMargin: Style.spacing.sm
+            anchors.top: parent.top; anchors.topMargin: -height / 2
+            width: escapeHint.implicitWidth + Style.space(8); height: escapeHint.implicitHeight
+            color: Color.menu.background; z: 2
+            Text {
+              id: escapeHint
+              anchors.centerIn: parent
+              text: "esc"
+              color: Color.menu.text; opacity: 0.62
+              font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+            }
+          }
+          onTextEdited: {
+            if (root.previewingSelection || root.editingPreviewUrl) {
+              root.previewingSelection = false; root.editingPreviewUrl = true; root.selectedIndex = -1; root.pendingSelectionIndex = -1; root.statusMessage = ""
+              return
+            }
+            root.query = text; root.selectedIndex = -1; root.pendingSelectionIndex = -1; root.statusMessage = ""
+            root.searchHasMore = false; root.searchLoading = true
+            if (!root.query.trim()) { root.results = root.defaultResults; root.noResultsState = false }
+            searchDebounce.restart()
+          }
+          Keys.onPressed: function(event) {
+            var directSlot = root.resultShortcutSlot(event.key)
+            root.updateModifierState(event, true)
+            if (event.key === Qt.Key_Escape && (root.previewingSelection || root.editingPreviewUrl)) { root.restoreSearchQuery(); event.accepted = true }
+            else if (event.key === Qt.Key_Escape) { root.dismiss(); event.accepted = true }
+            else if (event.key === Qt.Key_Tab && event.modifiers === Qt.NoModifier) { root.toggleSearchScope(); event.accepted = true }
+            else if (!root.query.trim() && event.key === Qt.Key_Up) { root.moveTopSelection(-1); event.accepted = true }
+            else if (!root.query.trim() && event.key === Qt.Key_Down) { root.moveTopSelection(1); event.accepted = true }
+            else if (root.query.trim() && event.key === Qt.Key_Up) { root.moveSelection(-1); event.accepted = true }
+            else if (root.query.trim() && event.key === Qt.Key_Down) { root.moveSelection(1); event.accepted = true }
+            else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.activateCurrent(false); event.accepted = true }
+            else if (event.modifiers === Qt.ControlModifier && directSlot >= 0 && directSlot < root.resultCount) { root.activateIndex(root.shortcutIndex(directSlot)); event.accepted = true }
+            else if (event.key === Qt.Key_N && event.modifiers === Qt.ControlModifier) { root.requestAddCurrentUrl(); event.accepted = true }
+            else if (event.key === Qt.Key_S && event.modifiers === Qt.ControlModifier) { root.beginSettings(); event.accepted = true }
+            else if (event.key === Qt.Key_E && event.modifiers === Qt.ControlModifier) { root.beginEdit(); event.accepted = true }
+            else if (event.key === Qt.Key_T && event.modifiers === Qt.ControlModifier) { root.activateCurrent(true); event.accepted = true }
+            else if (event.key === Qt.Key_C && event.modifiers === Qt.ControlModifier && !root.editingPreviewUrl && root.selectedResult() && !root.selectedResult().action) { worker.request({type:"copy",bookmark_id:root.selectedResult().id}); event.accepted=true }
+            else if (event.key === Qt.Key_D && event.modifiers === Qt.ControlModifier) { root.requestDelete(); event.accepted = true }
+          }
+          Keys.onReleased: function(event) { root.updateModifierState(event, false) }
+        }
+        Column {
+          id: topBookmarks
+          visible: root.mode === "search" && root.query.trim().length === 0
+          width: parent.width; height: root.resultWindowHeight; spacing: Style.spacing.xs
+          Repeater {
+            model: root.results
+            delegate: Rectangle {
+              required property int index; required property var modelData
+              readonly property bool showingShortcuts: root.controlHeld && index === root.selectedIndex && !modelData.action
+              width: topBookmarks.width; height: Style.space(58); radius: root.contentCornerRadius
+              color: index === root.selectedIndex ? Color.menu.selectedBackground : "transparent"
+              MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: root.selectedIndex = index; onClicked: root.activateIndex(index) }
+              Text { id: topShortcutHint; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld; text: "Ctrl+" + root.resultShortcutKey(index); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+              Column {
+                visible: !parent.showingShortcuts
+                anchors.left: parent.left; anchors.right: topShortcutHint.visible ? topShortcutHint.left : parent.right; anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md; spacing: Style.spacing.xs
+                Text { width: parent.width; text: modelData.title || root.domain(modelData.originalUrl); textFormat: Text.PlainText; elide: Text.ElideRight; color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium }
+                Text { width: parent.width; text: root.domain(modelData.originalUrl) + ((modelData.tags || []).length ? "  ·  " + modelData.tags.slice(0, 3).join(" · ") : ""); textFormat: Text.PlainText; elide: Text.ElideRight; color: Color.menu.text; opacity: 0.52; font.family: Style.font.menuFamily; font.pixelSize: Style.font.bodySmall }
+              }
+              ResultShortcutContent {
+                visible: parent.showingShortcuts
+                anchors.left: parent.left; anchors.right: topShortcutHint.left; anchors.top: parent.top; anchors.bottom: parent.bottom
+                anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md
+                controller: root
+              }
+            }
           }
         }
-
-        Item {
-          width: parent.width
-
-          height:
-            parent.height
-            - Style.space(42)
-            - Style.space(48)
-            - parent.spacing * 2
-
-          ListView {
-            id: bookmarkList
-
-            anchors.fill: parent
-            model: root.activeResults
-
-            clip: true
-            spacing: Style.spacing.xs
-            boundsBehavior: Flickable.StopAtBounds
-
-            delegate: BorderSurface {
-              id: row
-
-              required property int index
-              required property var modelData
-
-              readonly property bool selected:
-                row.index === root.selectedIndex
-
-              readonly property bool bookmarkMode:
-                root.viewMode === 0
-
-              readonly property bool tagMode:
-                root.viewMode === 1
-
-              readonly property bool keywordMode:
-                root.viewMode === 2
-
-              readonly property var bookmark:
-                row.bookmarkMode
-                  ? row.modelData
-                  : row.keywordMode
-                    ? row.modelData.bookmark
-                    : null
-
-              readonly property bool keywordResult:
-                row.bookmarkMode
-                  && root.keywordAction
-                  && root.keywordAction.bookmark.id === row.bookmark.id
-
-              width: ListView.view.width
-              height: Style.space(62)
-
-              radius: Style.cornerRadius
-
-              color:
-                row.selected
-                  ? Color.menu.selectedBackground
-                  : "transparent"
-
-              borderSpec:
-                row.selected
-                  ? Border.surfaceSpec(
-                      "menu",
-                      "selected-border",
-                      Color.menu.selectedBorder,
-                      0
-                    )
-                  : Border.none()
-
-              Item {
-                id: bookmarkIcon
-
-                anchors.left: parent.left
-                anchors.leftMargin: Style.spacing.md
-                anchors.verticalCenter: parent.verticalCenter
-
-                width: Style.space(30)
-                height: Style.space(30)
-
-                Image {
-                  id: faviconImage
-                  anchors.centerIn: parent
-                  width: Style.space(24)
-                  height: Style.space(24)
-                  visible: row.bookmarkMode
-                  source: row.bookmarkMode
-                    ? String(row.bookmark.favicon || "")
-                    : ""
-                  sourceSize.width: 64
-                  sourceSize.height: 64
-                  fillMode: Image.PreserveAspectFit
-                  asynchronous: true
-                  cache: false
-                }
-
-                Text {
-                  anchors.fill: parent
-                  visible:
-                    !row.bookmarkMode
-                    || faviconImage.status !== Image.Ready
-                  text:
-                    row.tagMode
-                      ? "#"
-                      : row.keywordMode
-                        ? "K"
-                        : ""
-
-                  color:
-                    row.selected
-                      ? Color.menu.selectedText
-                      : Color.menu.text
-
-                  font.family: Style.font.menuFamily
-                  font.pixelSize:
-                    row.bookmarkMode
-                      ? Style.font.iconLarge
-                      : Style.font.heading
-
-                  horizontalAlignment: Text.AlignHCenter
-                  verticalAlignment: Text.AlignVCenter
-                }
-              }
-
+        ListView {
+          id: searchResults
+          visible: root.mode === "search" && root.query.trim().length > 0; width: parent.width; spacing: Style.spacing.xs
+          height: root.noResultsState ? Style.space(44) : root.resultWindowHeight
+          clip: true; model: root.results; boundsBehavior: Flickable.StopAtBounds; snapMode: ListView.SnapToItem
+          Controls.ScrollBar.vertical: Controls.ScrollBar {}
+          property int visibleStartIndex: 0
+          onContentYChanged: {
+            var found = indexAt(width / 2, contentY + 1)
+            if (found >= 0) visibleStartIndex = found
+          }
+          onAtYEndChanged: if (atYEnd && root.searchHasMore) root.loadNextSearchPage()
+          footer: Item { width: searchResults.width; height: root.searchHasMore ? Style.space(24) : 0 }
+          delegate: Rectangle {
+              required property int index; required property var modelData
+              readonly property bool showingShortcuts: root.controlHeld && index === root.selectedIndex && !modelData.action
+              width: contentColumn.width; height: Style.space(58); radius: root.contentCornerRadius
+              color: index === root.selectedIndex ? Color.menu.selectedBackground : "transparent"
+              MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: if (!root.editingPreviewUrl) root.previewSelection(index); onClicked: root.activateIndex(index) }
+              Text { id: shortcutHint; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld && index >= searchResults.visibleStartIndex && index < searchResults.visibleStartIndex + root.resultCount; text: "Ctrl+" + root.resultShortcutKey(index - searchResults.visibleStartIndex); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
               Column {
-                anchors.left: bookmarkIcon.right
-                anchors.leftMargin: Style.spacing.sm
-                anchors.right: parent.right
-                anchors.rightMargin: Style.spacing.md
-                anchors.verticalCenter: parent.verticalCenter
-
-                spacing: Style.spacing.xs
-
-                Text {
+                visible: !parent.showingShortcuts
+                anchors.left: parent.left; anchors.right: shortcutHint.visible ? shortcutHint.left : parent.right; anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md; spacing: Style.spacing.xs
+                HighlightedText {
                   width: parent.width
-                  text:
-                    row.bookmarkMode
-                      ? root.displayTitle(row.bookmark)
-                      : row.tagMode
-                        ? "#" + row.modelData.tag
-                        : row.modelData.keyword
-                  textFormat: Text.PlainText
-
-                  color:
-                    row.selected
-                      ? Color.menu.selectedText
-                      : Color.menu.text
-
-                  font.family: Style.font.menuFamily
-                  font.pixelSize: Style.font.heading
-                  font.weight: Font.Medium
-                  opacity:
-                    row.bookmarkMode && !row.bookmark.title
-                      ? 0.68
-                      : 1
-
-                  elide: Text.ElideRight
+                  value: modelData.title || root.domain(modelData.originalUrl)
+                  needle: root.query
+                  foreground: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text
+                  fontPixelSize: Style.font.heading; fontWeight: Font.Medium
                 }
-
-                Text {
+                HighlightedText {
                   width: parent.width
-
-                  text:
-                    row.tagMode
-                      ? row.modelData.count
-                        + (row.modelData.count === 1 ? " bookmark" : " bookmarks")
-                      : row.keywordMode
-                        ? root.displayTitle(row.bookmark)
-                          + (
-                            row.modelData.parameterized
-                              ? "  ·  accepts search terms"
-                              : ""
-                          )
-                        : row.keywordResult
-                          ? "Search for “" + root.keywordAction.terms + "”"
-                          : row.bookmark.url
-                            + (
-                              row.bookmark.tags.length
-                                ? "  ·  " + row.bookmark.tags.join(" · ")
-                                : ""
-                            )
-                            + (
-                              row.bookmark.keyword
-                                ? "  ·  " + row.bookmark.keyword
-                                : ""
-                            )
-                  textFormat: Text.PlainText
-
-                  color: Color.menu.text
-                  opacity: 0.52
-
-                  font.family: Style.font.menuFamily
-                  font.pixelSize: Style.font.bodySmall
-
-                  elide: Text.ElideRight
+                  value: modelData.action === "open_url" ? modelData.originalUrl + "  ·  Ctrl+N to add bookmark" : root.domain(modelData.originalUrl) + ((modelData.tags || []).length ? "  ·  " + modelData.tags.slice(0, 3).join(" · ") : "")
+                  needle: root.query
+                  foreground: Util.alpha(Color.menu.text, 0.52)
+                  matchedForeground: Color.menu.selectedText
+                  fontPixelSize: Style.font.bodySmall
                 }
               }
+              ResultShortcutContent {
+                visible: parent.showingShortcuts
+                anchors.left: parent.left; anchors.right: shortcutHint.left; anchors.top: parent.top; anchors.bottom: parent.bottom
+                anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md
+                controller: root
+              }
+          }
+          Text { visible: root.noResultsState && !worker.error; width: parent.width; height: Style.space(44); text: "No matching bookmarks"; color: Color.menu.text; opacity: 0.55; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; font.family: Style.font.menuFamily }
+        }
+        Column {
+          visible: root.mode === "form"; width: parent.width; spacing: Style.spacing.sm
+          Controls.TextField { id: urlField; width: parent.width; placeholderText: "URL"; selectByMouse: true; font.family: Style.font.menuFamily; onAccepted: root.saveForm(); Keys.onPressed: function(e){if(e.key===Qt.Key_Escape){root.cancelSecondary();e.accepted=true}} }
+          Controls.TextField { id: titleField; width: parent.width; placeholderText: "Title"; selectByMouse: true; font.family: Style.font.menuFamily; onTextEdited: if(!root.applyingMetadata) root.titleEdited=true; onAccepted: root.saveForm(); Keys.onPressed: function(e){if(e.key===Qt.Key_Escape){root.cancelSecondary();e.accepted=true}} }
+          Controls.TextArea {
+            id: descriptionField
+            width: parent.width; height: Style.space(70); placeholderText: "Description"
+            wrapMode: TextEdit.Wrap; selectByMouse: true; font.family: Style.font.menuFamily
+            onTextChanged: if(activeFocus&&!root.applyingMetadata) root.descriptionEdited=true
+            Keys.priority: Keys.BeforeItem
+            Keys.onPressed: function(e) {
+              if (e.key === Qt.Key_Tab && e.modifiers === Qt.NoModifier) {
+                tagsField.forceActiveFocus(); e.accepted = true
+              } else if (e.key === Qt.Key_Backtab || (e.key === Qt.Key_Tab && e.modifiers === Qt.ShiftModifier)) {
+                titleField.forceActiveFocus(); e.accepted = true
+              } else if (e.key === Qt.Key_Escape) {
+                root.cancelSecondary(); e.accepted = true
+              } else if ((e.key === Qt.Key_Return || e.key === Qt.Key_Enter) && (e.modifiers & Qt.ControlModifier)) {
+                root.saveForm(); e.accepted = true
+              }
+            }
+          }
+          Controls.TextField { id: tagsField; width: parent.width; placeholderText: "Tags, comma separated"; selectByMouse: true; font.family: Style.font.menuFamily; onAccepted: root.saveForm(); Keys.onPressed: function(e){if(e.key===Qt.Key_Escape){root.cancelSecondary();e.accepted=true}} }
+          Row { visible: root.suggestedTags.length > 0; spacing: Style.spacing.xs; Repeater { model: root.suggestedTags; delegate: Controls.Button { required property string modelData; text: "+ " + modelData; onClicked: { var values=tagsField.text.split(",").map(function(v){return v.trim()}).filter(Boolean); if(values.indexOf(modelData)<0) values.push(modelData); tagsField.text=values.join(", ") } } } }
+          Item {
+            width: parent.width; height: Style.space(38)
+            Text { anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; text: "Enter to save"; color: Color.menu.text; opacity: 0.45; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Row {
+              anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: Style.spacing.sm
+              Button { width: Style.space(88); height: Style.space(34); text: "Cancel"; bordered: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.cancelSecondary() }
+              Button { width: Style.space(88); height: Style.space(34); text: root.editingBookmark ? "Save" : "Add"; bordered: true; selected: true; focusable: true; enabled: urlField.text.trim().length > 0; opacity: enabled ? 1 : 0.42; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.saveForm() }
+            }
+          }
+        }
+        Column {
+          visible: root.mode === "settings"; width: parent.width; spacing: Style.spacing.md
+          Keys.onPressed: function(event) {
+            if (event.key === Qt.Key_Escape) { root.cancelSecondary(); event.accepted = true }
+            else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && event.modifiers === Qt.ControlModifier) { root.saveSettings(); event.accepted = true }
+          }
 
-              MouseArea {
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
+          Text {
+            width: parent.width; text: "Settings"; color: Color.menu.text
+            font.family: Style.font.menuFamily; font.pixelSize: Style.font.title; font.weight: Font.DemiBold
+          }
 
-                onEntered:
-                  root.selectedIndex = row.index
+          Column {
+            width: parent.width; spacing: Style.spacing.xs
+            Text { text: "Default search"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Row {
+              spacing: Style.spacing.sm
+              Button { id: settingsKeyCatcher; width: Style.space(150); height: Style.space(34); text: "Bookmarks & tags"; bordered: true; selected: root.draftSearchScope === "all"; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftSearchScope = "all" }
+              Button { width: Style.space(110); height: Style.space(34); text: "Tags only"; bordered: true; selected: root.draftSearchScope === "tags"; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftSearchScope = "tags" }
+            }
+          }
 
-                onClicked: {
-                  root.selectedIndex = row.index
-                  root.activateCurrent(false, false)
+          Column {
+            width: parent.width; spacing: Style.spacing.xs
+            Text { text: "Visible results"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Row {
+              width: parent.width
+              spacing: Style.spacing.sm
+              Repeater {
+                model: root.maximumResultCount - 2
+                delegate: Button {
+                  required property int index
+                  readonly property int count: index + 3
+                  width: root.resultCountButtonWidth; height: Style.space(34); text: String(count); bordered: true
+                  selected: root.draftResultCount === count; focusable: true
+                  foreground: Color.menu.text; accent: Color.menu.selectedText
+                  onClicked: root.draftResultCount = count
                 }
               }
             }
           }
 
           Column {
-            anchors.centerIn: parent
-            spacing: Style.spacing.sm
-            visible: root.activeResults.length === 0
-
-            Text {
-              width: Style.space(360)
-
-              text:
-                store.error
-                  ? ""
-                  : root.viewMode === 1
-                    ? "#"
-                    : root.viewMode === 2
-                      ? "K"
-                      : ""
-              color:
-                store.error
-                  ? Color.urgent
-                  : Color.menu.selectedText
-
-              font.family: Style.font.menuFamily
-              font.pixelSize: Style.font.displayLarge
-              horizontalAlignment: Text.AlignHCenter
+            width: parent.width; spacing: Style.spacing.xs
+            Text { text: "Open bookmarks"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Row {
+              spacing: Style.spacing.sm
+              Button { width: Style.space(150); height: Style.space(34); text: "In a new tab"; bordered: true; selected: !root.draftOpenInNewWindow; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftOpenInNewWindow = false }
+              Button { width: Style.space(150); height: Style.space(34); text: "In a new window"; bordered: true; selected: root.draftOpenInNewWindow; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftOpenInNewWindow = true }
             }
+          }
 
-            Text {
-              width: Style.space(360)
+          Column {
+            width: parent.width; spacing: Style.spacing.xs
+            Text { text: "Details for pasted URLs"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Row {
+              spacing: Style.spacing.sm
+              Button { width: Style.space(150); height: Style.space(34); text: "Fetch automatically"; bordered: true; selected: root.draftFetchPageDetails; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftFetchPageDetails = true }
+              Button { width: Style.space(150); height: Style.space(34); text: "Never fetch"; bordered: true; selected: !root.draftFetchPageDetails; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftFetchPageDetails = false }
+            }
+            Text { width: parent.width; text: "Fetching contacts the website and reveals your IP address and requested URL."; color: Color.menu.text; opacity: 0.45; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+          }
 
-              text:
-                store.error
-                  ? store.error
-                  : root.currentQuery()
-                    ? "No matching " + root.viewName.toLowerCase()
-                    : root.viewMode === 1
-                      ? "No tags yet"
-                      : root.viewMode === 2
-                        ? "No keywords yet"
-                        : "No bookmarks yet"
-              textFormat: Text.PlainText
-
-              color: Color.menu.text
-              opacity: 0.7
-
-              font.family: Style.font.menuFamily
-              font.pixelSize: Style.font.title
-
-              horizontalAlignment: Text.AlignHCenter
-              wrapMode: Text.WordWrap
+          Item {
+            width: parent.width; height: Style.space(38)
+            Text { anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; text: "Ctrl+Enter to save · Escape to cancel"; color: Color.menu.text; opacity: 0.45; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Row {
+              anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: Style.spacing.sm
+              Button { width: Style.space(88); height: Style.space(34); text: "Cancel"; bordered: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.cancelSecondary() }
+              Button { width: Style.space(88); height: Style.space(34); text: "Save"; bordered: true; selected: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.saveSettings() }
             }
           }
         }
-
-        Text {
-          width: parent.width
-          height: Style.space(48)
-
-          text:
-            store.error
-              ? store.error
-              : store.saving
-                ? "Saving…"
-                : root.statusMessage
-                  ? root.statusMessage
-                  : root.viewMode === 1
-                    ? "Enter Set  Ctrl+Enter Append  ↑↓ Select\nTab Keywords  Shift+Tab Bookmarks"
-                    : root.viewMode === 2
-                      ? "Enter Set  Ctrl+Enter Append  ↑↓ Select\nTab Bookmarks  Shift+Tab Tags"
-                      : "Enter Open  Ctrl+C Copy  Ctrl+T Window  Ctrl+Tab Browser\nTab Tags  Ctrl+V Paste  Ctrl+I Import  Ctrl+N Add  Ctrl+E Edit  Ctrl+, Web"
-          textFormat: Text.PlainText
-
-          color: store.error ? Color.urgent : Color.menu.text
-          opacity: store.error ? 1 : 0.48
-
-          font.family: Style.font.menuFamily
-          font.pixelSize: Style.font.caption
-          lineHeight: 1.35
-
-          horizontalAlignment: Text.AlignHCenter
-          verticalAlignment: Text.AlignVCenter
+        Column {
+          visible: root.mode === "delete"; width: parent.width; spacing: Style.spacing.md
+          Text { width: parent.width; text: "Delete “" + (root.editingBookmark ? (root.editingBookmark.title || root.domain(root.editingBookmark.originalUrl)) : "") + "”?"; color: Color.menu.text; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading }
+          Text { width: parent.width; text: "Enter confirms · Escape cancels"; color: Color.menu.text; opacity: 0.5; font.family: Style.font.menuFamily }
+          Item { id: deleteKeyCatcher; width: 1; height: 1; Keys.onPressed: function(e){if(e.key===Qt.Key_Escape){root.cancelSecondary();e.accepted=true}else if(e.key===Qt.Key_Return||e.key===Qt.Key_Enter){worker.request({type:"delete",bookmark_id:root.editingBookmark.id});e.accepted=true}} }
         }
+        Text { visible: Boolean(root.statusMessage || worker.error); width: parent.width; text: root.statusMessage || worker.error; color: Color.urgent; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
       }
 
-      BookmarkEditor {
-        id: editor
-
-        z: 10
-
-        anchors.fill: parent
-        anchors.topMargin: card.contentTopInset
-        anchors.rightMargin: card.contentRightInset
-        anchors.bottomMargin: card.contentBottomInset
-        anchors.leftMargin: card.contentLeftInset
-
-        urlValidator: function(value) {
-          return store.normalizeUrl(value)
-        }
-
-        webDetailsEnabled: root.networkEnrichmentEnabled
-
-        onSubmitted: function(
-          bookmarkId,
-          title,
-          url,
-          tags,
-          keyword,
-          favicon
-        ) {
-          root.saveEditor(bookmarkId, title, url, tags, keyword, favicon)
-        }
-
-        onCanceled: root.refocusList()
-        onWebDetailsSettingsRequested: root.openNetworkSettings()
-      }
-
-      BookmarkImport {
-        id: importer
-
-        z: 15
-        anchors.fill: parent
-        anchors.topMargin: card.contentTopInset
-        anchors.rightMargin: card.contentRightInset
-        anchors.bottomMargin: card.contentBottomInset
-        anchors.leftMargin: card.contentLeftInset
-
-        helperPath: root.helperPath
-        dataPath: store.dataPath
-
-        onConfirmed: function(items) {
-          root.finishImport(items)
-        }
-
-        onCanceled: root.refocusList()
-      }
-
-      BrowserPicker {
-        id: browserPicker
-
-        z: 18
-        anchors.fill: parent
-        anchors.topMargin: card.contentTopInset
-        anchors.rightMargin: card.contentRightInset
-        anchors.bottomMargin: card.contentBottomInset
-        anchors.leftMargin: card.contentLeftInset
-
-        helperPath: root.helperPath
-
-        onSelected: function(browser) {
-          var bookmark = root.browserTarget
-          root.browserTarget = null
-          root.activateBookmark(bookmark, false, browser)
-        }
-
-        onCanceled: {
-          root.browserTarget = null
-          root.refocusList()
-        }
-      }
-
-      ConfirmDialog {
-        id: deleteConfirm
-
-        z: 20
-        anchors.fill: parent
-
-        opened: root.deleteConfirmOpen
-        // ConfirmDialog renders its message with Text.AutoText. Keep this
-        // strictly static so imported or fetched fields never reach that sink.
-        message: "Delete the selected bookmark?"
-
-        cancelText: "Cancel"
-        confirmText: "Delete"
-
-        background: Color.menu.background
-        foreground: Color.menu.text
-        scrim: Util.alpha(Color.menu.background, 0.76)
-        selectedBackground: Color.menu.selectedBackground
-        selectedText: Color.menu.selectedText
-        fontFamily: Style.font.menuFamily
-
-        onCanceled: root.cancelDelete()
-        onConfirmed: root.confirmDelete()
-      }
-
-      MenuEntryDialog {
-        id: menuEntryDialog
-
-        z: 25
-        anchors.fill: parent
-        opened: root.menuEntryDialogOpen
-        installed: root.menuEntryInstalled
-        busy: menuEntryProcess.running
-        background: Color.menu.background
-        foreground: Color.menu.text
-        scrim: Util.alpha(Color.menu.background, 0.76)
-        selectedBackground: Color.menu.selectedBackground
-        selectedText: Color.menu.selectedText
-        fontFamily: Style.font.menuFamily
-
-        onCanceled: root.cancelMenuEntryDialog()
-        onAddRequested: root.requestMenuEntryOperation("install")
-        onRemoveRequested: root.requestMenuEntryOperation("remove")
-      }
-
-      NetworkEnrichmentDialog {
-        id: networkDialog
-
-        z: 30
-        anchors.fill: parent
-        opened: root.networkDialogOpen
-        webEnabled: root.networkEnrichmentEnabled
-        busy: networkSettingProcess.running
-        background: Color.menu.background
-        foreground: Color.menu.text
-        scrim: Util.alpha(Color.menu.background, 0.76)
-        selectedBackground: Color.menu.selectedBackground
-        selectedText: Color.menu.selectedText
-        fontFamily: Style.font.menuFamily
-
-        onCanceled: root.closeNetworkSettings()
-        onSettingRequested: function(enabled) {
-          root.requestNetworkSetting(enabled)
-        }
-      }
     }
   }
 }

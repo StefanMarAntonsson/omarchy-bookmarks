@@ -12,8 +12,8 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(manifest["schemaVersion"], 1)
         self.assertEqual(manifest["id"], "stefanmara.bookmarks")
         self.assertNotEqual(manifest["id"].split(".", 1)[0], "omarchy")
-        self.assertIn("menu", manifest["kinds"])
-        entry_point = manifest["entryPoints"]["menu"]
+        self.assertIn("overlay", manifest["kinds"])
+        entry_point = manifest["entryPoints"]["overlay"]
         self.assertFalse(Path(entry_point).is_absolute())
         self.assertNotIn("..", Path(entry_point).parts)
         self.assertTrue((PROJECT_ROOT / entry_point).is_file())

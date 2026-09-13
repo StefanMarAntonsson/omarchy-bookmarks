@@ -1,230 +1,211 @@
 # Bookmarks for Omarchy
 
-Bookmarks for Omarchy keeps your bookmarks independent of any one browser.
-Search one library, open a bookmark in your default browser or another installed
-browser, and copy its URL to share without remembering which browser originally
-saved it. The menu searches only your bookmarks, never commands or installed
-applications, and follows the active Omarchy theme.
+A quiet, keyboard-first bookmark launcher for Omarchy. It is a Quickshell
+overlay styled like a compact browser address bar, backed by a resident Rust
+worker and SQLite.
 
-![Bookmarks for Omarchy](preview.png)
+The closed launcher consumes no window space. When opened it shows a centered
+search field with the most-used bookmarks in individual result rows. Search
+results replace those rows after typing in a scrollable three-to-ten-row
+window, according to the user's setting. Literal query matches are highlighted
+in result titles and URLs.
 
-## Features
+## Architecture
 
-- Search bookmark titles, URLs, tags, and keywords.
-- Filter by tag with `#tag` and combine filters such as `#dash git`.
-- Browse dedicated bookmark, tag, and keyword lists with `Tab`.
-- Rank an empty search by frequently and recently opened bookmarks.
-- Add, edit, delete, and import bookmarks without leaving the menu.
-- Paste an HTTP(S) URL into the bookmark editor so its title, tags, and keyword
-  can be reviewed before saving.
-- Optionally fetch titles and favicons for pasted URLs after an explicit,
-  persisted opt-in. Web fetching is off by default.
-- Import Netscape bookmark HTML or this plugin's JSON format.
-- Open in a browser tab by default or in a new window with `Ctrl+T`.
-- Open a bookmark in any installed HTTPS browser with `Ctrl+Tab` without
-  changing the system default.
-- Copy the selected bookmark URL with `Ctrl+C`.
-- Optionally add a **Bookmarks** entry to the main Omarchy menu after an
-  explicit in-plugin confirmation.
-- Serialize and persist changes atomically, with timestamped backups before imports.
+- `Bookmarks.qml` owns presentation, focus, keyboard handling, bounded result
+  rows, selection previews in the input, and compact edit/delete modes.
+- `WorkerClient.qml` owns one managed child process, version-1 newline-delimited
+  JSON framing, response validation, stale-response IDs, and bounded exponential
+  restart backoff.
+- `src/main.rs` is the protocol/server loop. Linux parent-death signaling stops
+  it when `omarchy-shell` exits.
+- `src/repository.rs` owns SQLite, numbered migrations, CRUD, foreign keys,
+  legacy migration, and the refreshed in-memory index.
+- `src/search.rs`, `src/url_key.rs`, and `src/metadata.rs` own ranking,
+  conservative duplicate keys, and bounded HTTP metadata retrieval.
+- `src/browser.rs` discovers registered HTTPS handlers from XDG desktop files,
+  identifies the default, and resolves explicit browser launches.
 
-The plugin accepts HTTP and HTTPS URLs only. It intentionally rejects
-JavaScript bookmarklets, `file:` URLs, `mailto:` links, and folders.
+QML never reads SQLite, performs network requests, or scans the bookmark
+collection. Messages are limited to 64 KiB and responses to 256 KiB. Search
+returns at most ten bookmarks per page and loads further matches while scrolling.
 
-## Requirements
+The old QML store, import/editor components, `bookmark_helper.py`, and
+`bookmark_store_init.sh` remain for compatibility and migration regression
+coverage. See `docs/existing-architecture.md` for the pre-migration baseline.
 
-- Omarchy with shell plugin support.
-- Python 3. Web enrichment fails closed on Python older than 3.13 because older
-  standard-library IP classifications contain known false results.
-- `zenity` for the import file picker.
-- `wl-clipboard` for adding from and copying to the clipboard.
-- ImageMagick for favicons from imported HTML and clipboard metadata. Bookmark
-  operations and plugin JSON imports still work without ImageMagick, but new
-  external favicons cannot be converted and embedded.
+## Build and worker location
 
-On Omarchy, missing optional packages can be installed with:
+Build the worker in the plugin checkout:
 
 ```bash
-omarchy pkg add python zenity wl-clipboard imagemagick
+cargo build --release
 ```
 
-## Installation
+During development the launcher uses:
 
-Install and enable the plugin from GitHub:
+```text
+<plugin directory>/target/release/omarchy-bookmarks-worker
+```
+
+For an installed plugin, the launcher also accepts:
+
+```text
+$XDG_DATA_HOME/stefanmara.bookmarks/bin/omarchy-bookmarks-worker
+```
+
+falling back to `~/.local/share/stefanmara.bookmarks/bin/` when
+`XDG_DATA_HOME` is unset. Copy the release binary there and keep it executable
+if the plugin checkout does not contain `target/release`.
+
+## Development and validation
 
 ```bash
-omarchy plugin add https://github.com/StefanMarAntonsson/omarchy-bookmarks.git --enable
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+./tests/run
+omarchy plugin validate .
 ```
 
-The plugin can always be opened directly with:
+The test suite uses temporary SQLite databases and deterministic loopback HTTP
+servers. It does not contact public websites or migrate the live store.
+
+For local development, build and validate first. Only then link or install the
+checkout under `~/.config/omarchy/plugins/stefanmara.bookmarks`. Changing the
+active shell configuration is deliberately not part of the build.
+
+Open the enabled plugin with:
 
 ```bash
-omarchy-shell shell toggle stefanmara.bookmarks
+omarchy-shell shell toggle stefanmara.bookmarks '{}'
 ```
 
-On first open, the plugin offers to add a **Bookmarks** entry to the main
-Omarchy menu. It explains the exact configuration file involved and changes it
-only after you choose **Add entry**. You can revisit this choice with `Ctrl+M`.
-Once the entry is added, no separate keybinding is required.
+## Hyprland shortcut
 
-For faster access, a direct keybinding is recommended. Use `Super+B` or replace
-it with any key combination you prefer in `~/.config/hypr/bindings.lua`:
+In `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind(
   "SUPER + B",
   "Bookmarks",
-  "omarchy-shell shell toggle stefanmara.bookmarks"
+  "omarchy-shell shell toggle stefanmara.bookmarks '{}'"
 )
 ```
 
 ## Keyboard controls
 
-### Bookmark list
-
 | Key | Action |
 | --- | --- |
-| Type | Search bookmarks |
-| `Up` / `Down` | Select a bookmark |
-| `Enter` | Open in a new tab |
-| `Ctrl+C` | Copy the selected bookmark URL |
-| `Ctrl+T` | Open in a new window |
-| `Ctrl+Tab` | Choose an installed browser and open there |
-| `Tab` | Show tags, then keywords |
-| `Ctrl+M` | Add or remove the main Omarchy menu entry |
-| `Ctrl+N` | Add a bookmark manually |
-| `Ctrl+V` | Open the editor with the HTTP(S) URL in the clipboard |
-| `Ctrl+I` | Import an HTML or JSON bookmark file |
+| Empty input | Show the configured number of most-used bookmarks as individual result rows |
+| Type | Search; results replace the most-used rows |
+| `Tab` | Switch between bookmark search and tag-only search |
+| `Up` / `Down` | Change selection and preview its URL while searching |
+| Edit a previewed URL | Clear the bookmark selection and use the field as a direct URL |
+| `Enter` | Open the selected bookmark or a valid HTTP/HTTPS URL in the field |
+| `Ctrl+1` – `Ctrl+9`, `Ctrl+0` | Open results 1–10 directly |
+| Hold `Ctrl` | Replace the selected row with its actions and reveal result-row shortcuts; an empty input shows `Ctrl+N` and `Ctrl+S` |
+| Hold `Ctrl+Alt` | Replace the selected row actions with configured non-default browsers |
+| `Ctrl+N` | Add a bookmark, prefilling a valid non-duplicate URL from the field |
+| `Ctrl+S` | Open settings |
 | `Ctrl+E` | Edit the selected bookmark |
-| `Ctrl+,` | Review or change the web-details preference |
-| `Delete` | Delete with confirmation |
-| `Escape` | Clear the search, then close |
+| `Ctrl+D` | Request deletion of the selected bookmark; `Enter` confirms |
+| `Ctrl+C` | Copy the selected URL |
+| `Ctrl+T` | Use the opposite of the configured opening behavior |
+| `Ctrl+Alt+1` – `Ctrl+Alt+9` | Open the selected bookmark or direct URL in the corresponding configured non-default browser |
+| `Escape` | Restore the search from a URL preview/edit; press again to close |
 
-### Tag and keyword lists
+Settings use the same in-card form as adding a bookmark. They control the
+default search scope, whether three through ten results are visible (the settings
+row shows as many choices as fit the window), whether
+bookmarks open in a new tab or a new browser window, and whether pasting a URL may
+contact its website to suggest a title and description. Changes are saved in
+the SQLite database and apply immediately after saving as well as on future
+launcher opens. Website lookups are off by default because they disclose the
+requested URL and the user's IP address to the destination.
 
-| Key | Action |
-| --- | --- |
-| Type | Search the current list |
-| `Up` / `Down` | Select an item |
-| `Enter` | Replace the bookmark search with the selected item |
-| `Ctrl+Enter` | Append the selected item to the bookmark search |
-| `Tab` / `Shift+Tab` | Cycle forward or backward between lists |
-| `Escape` | Clear the list search, then return to bookmarks |
+When page-detail fetching is enabled, metadata suggestions never block saving.
+A late response fills title or description only if the user has not edited that
+field. Suggested tags are local, deterministic, limited to four, and require a
+click to accept.
 
-Parameterized keywords support `%s`, `%S`, and `{searchTerms}` URL templates.
-For example, a keyword named `mdn` can be used as `mdn flexbox`.
+## Data, migration, and recovery
 
-## Data and privacy
+SQLite is authoritative at:
 
-Bookmarks are stored outside the plugin checkout at:
+```text
+$XDG_DATA_HOME/stefanmara.bookmarks/bookmarks.sqlite3
+```
+
+The legacy source remains at:
 
 ```text
 $XDG_DATA_HOME/stefanmara.bookmarks/bookmarks.json
 ```
 
-When `XDG_DATA_HOME` is unset, the location is:
+On the first worker start, when no successful migration is recorded, a valid
+legacy version-3 JSON file is fully validated using the existing 64 MiB,
+50,000-bookmark, URL, field, and duplicate limits. The worker then creates a
+timestamped `bookmarks.json.migration-backup-*`, imports bookmarks, tags,
+keywords, and usage data in one transaction, preserves the original JSON, and
+records success in SQLite. It will not repeat the migration.
 
-```text
-~/.local/share/stefanmara.bookmarks/bookmarks.json
-```
+Malformed, unsafe, duplicate, or newer-format input stops migration without
+overwriting the JSON or creating a misleading success marker. The worker
+reports recovery guidance in the overlay. Repair the JSON or move it aside,
+then remove only the incomplete `bookmarks.sqlite3` files before restarting.
+Keep the JSON and timestamped backup until the migrated library has been
+verified.
 
-The directory and an empty bookmark store are created automatically on first
-run only when the data file does not already exist. An existing store is never
-overwritten during initialization, so bookmarks survive plugin updates and
-reinstallation.
+Foreign keys are enabled on every worker connection. Tags and bookmark-tag
+relations use separate indexed tables and cascade safely when a bookmark is
+deleted.
 
-Plugin updates and removal do not delete bookmarks. To remove all saved data,
-delete the data directory manually after removing the plugin.
+## URL and metadata policy
 
-The plugin does not change the main Omarchy menu unless you explicitly choose
-**Add entry**. If approved, the entry is stored as a clearly marked block in
-`~/.config/omarchy/extensions/omarchy-menu.jsonc`. Existing menu entries and
-comments are preserved. Your choice is stored privately in the plugin data
-directory. The entry is hidden while the plugin is disabled or absent, and the
-plugin removes its managed block during the normal disable/uninstall flow.
+Only fully qualified HTTP and HTTPS URLs (including the scheme) without
+embedded credentials are accepted. Duplicate
+keys lowercase schemes/hosts and remove only default ports. Query parameters,
+fragments, paths, percent encoding, and meaningful trailing slashes remain
+distinct.
 
-All writes are atomic and serialized. Imports create a private timestamped
-backup beside `bookmarks.json`; the newest ten backups are retained so repeated
-imports cannot grow the data directory indefinitely.
+Metadata fetching uses an ordinary Rust HTTP client, follows at most four
+redirects, has three-second connection and eight-second overall timeouts, reads
+at most 1 MiB, accepts HTML only, and supports Open Graph title/description,
+standard description metadata, and `<title>`. It executes no JavaScript and
+embeds no browser.
 
-Usage-ranking updates are kept in memory and flushed after five opens or five
-minutes, whichever comes first. Any bookmark edit flushes them immediately.
-This avoids rewriting a favicon-heavy store for every individual launch while
-keeping frequently used ordering persistent.
+## Remaining limitations
 
-If the store is malformed, contains invalid or duplicate-ID entries, or uses a
-newer data format, the plugin enters read-only recovery mode instead of
-overwriting it. Repair the file, or move it aside and restart the shell to begin
-with an empty store:
+- Legacy keyword data is preserved and searchable. Parameter substitution for
+  `%s`, `%S`, and `{searchTerms}` is not yet exposed by the minimal UI.
+- The former full browser picker, HTML/JSON import dialog, menu-entry manager,
+  favicon pipeline, and network opt-in panel remain in the repository but are
+  not exposed in the minimal overlay. Alternate-browser launching is available
+  directly through the first nine `Ctrl+Alt+number` shortcuts.
+- Metadata fetching currently follows the HTTP client's normal network policy;
+  deployments requiring SSRF-resistant destination filtering should keep the
+  feature disabled at the network layer until the prior helper's address
+  pinning is ported.
+- The release binary is built separately rather than committed to Git.
 
-```bash
-mv ~/.local/share/stefanmara.bookmarks/bookmarks.json \
-  ~/.local/share/stefanmara.bookmarks/bookmarks.json.recovery-$(date +%Y%m%d-%H%M%S)
-omarchy restart shell
-```
+## Performance
 
-Use the corresponding `$XDG_DATA_HOME` path if that variable is configured.
+Measured on the development machine with a release build, warm filesystem cache,
+and a private SQLite migration of the real 1,181-bookmark library:
 
-Web enrichment is **off by default**. In that state, `Ctrl+V` reads and validates
-the clipboard locally and opens the bookmark editor without making any network
-request. Use `Ctrl+,` or the **Paste details: Off** control in the editor to
-review a warning and explicitly enable enrichment. The choice is stored in the
-plugin's private `settings.json` and can be disabled again at any time.
+| Measurement | Result |
+| --- | ---: |
+| Worker startup through the `hello` response, 20-run mean | 5.25 ms |
+| Idle worker RSS | 1,884 KiB |
+| Empty search, 500 pipelined protocol round trips | 27.37 ms total (0.055 ms/response) |
+| `github` search, 500 pipelined protocol round trips | 417.04 ms total (0.834 ms/response) |
 
-When enabled, pasting a new URL contacts the destination and up to three public
-redirect destinations to fetch its title and favicon. This reveals the user's
-IP address and each requested URL to those sites and processes downloaded page
-and image data locally. The fetcher permits only public HTTP(S) destinations on
-their default ports, pins connections to checked DNS addresses, validates every
-redirect, keeps favicon URLs and redirects on the final page origin, sends no
-cookies or authorization, and applies strict response, image,
-connection-attempt, and wall-clock limits. If enrichment fails or times
-out, the editor still opens with the pasted URL.
-
-Browser discovery and bookmark imports do not access the network. Imported and
-downloaded favicons are converted to small PNG data URLs and stored inside
-`bookmarks.json`.
-
-## Updates and removal
-
-```bash
-omarchy plugin update stefanmara.bookmarks
-omarchy plugin remove stefanmara.bookmarks
-```
-
-Remove your recommended `Super+B` block (or custom binding) from
-`~/.config/hypr/bindings.lua` if the plugin is uninstalled. If Omarchy was not
-running during removal and could not perform automatic menu cleanup, remove the
-small block between the `BEGIN stefanmara.bookmarks` and
-`END stefanmara.bookmarks` comments in
-`~/.config/omarchy/extensions/omarchy-menu.jsonc`.
-
-## Development
-
-Validate the helper, storage initializer, manifest, QML, and live persistence
-regression tests:
-
-```bash
-./tests/run
-```
-
-For live development, link the checkout into Omarchy's plugin directory:
-
-```bash
-ln -s "$PWD" ~/.config/omarchy/plugins/stefanmara.bookmarks
-omarchy plugin enable stefanmara.bookmarks
-omarchy restart shell
-```
-
-Before publishing, validate the same manifest users will install:
-
-```bash
-omarchy plugin validate .
-```
+These are measurements, not promises. They include NDJSON encode/decode and
+SQLite/index startup where applicable, but the pipelined figures are throughput
+rather than interactive percentile latency. Hardware, library size, filesystem
+cache, and system load will change them.
 
 ## License
 
 [MIT](LICENSE)
-
-Third-party product names and site icons visible in the preview remain the
-property of their respective owners and are shown only as bookmark examples.

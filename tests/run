@@ -9,13 +9,19 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 sh tests/test_store_init.sh
 python3 -m py_compile bookmark_helper.py
 
+if command -v cargo >/dev/null 2>&1; then
+  cargo fmt --all -- --check
+  cargo clippy --all-targets -- -D warnings
+  cargo test --all-targets
+fi
+
 if command -v omarchy >/dev/null 2>&1; then
   omarchy plugin validate "$project_root"
 fi
 
 if command -v qmllint >/dev/null 2>&1 && [ -d /usr/share/omarchy/shell ]; then
   qmllint -I /usr/share/omarchy/shell \
-    Bookmarks.qml BrowserPicker.qml MenuEntryDialog.qml NetworkEnrichmentDialog.qml \
+    Bookmarks.qml WorkerClient.qml BrowserPicker.qml MenuEntryDialog.qml NetworkEnrichmentDialog.qml \
     BookmarkStore.qml BookmarkEditor.qml BookmarkImport.qml
 fi
 

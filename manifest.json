@@ -2,12 +2,12 @@
   "schemaVersion": 1,
   "id": "stefanmara.bookmarks",
   "name": "Bookmarks",
-  "version": "1.0.4",
+  "version": "2.0.0",
   "author": "Stefan Mar Antonsson",
-  "description": "Search, import, and manage URL bookmarks",
-  "kinds": ["menu"],
+  "description": "A minimal keyboard-first bookmark launcher",
+  "kinds": ["overlay"],
   "keepLoaded": true,
   "entryPoints": {
-    "menu": "Bookmarks.qml"
+    "overlay": "Bookmarks.qml"
   }
 }
