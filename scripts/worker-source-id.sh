@@ -9,7 +9,7 @@
 set -eu
 export LC_ALL=C
 
-root=${1:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
+root=${1:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}
 cd -- "$root"
 
 {

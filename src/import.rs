@@ -549,12 +549,35 @@ struct ScratchDir {
 
 impl ScratchDir {
     fn create(parent: &Path) -> Result<Self, String> {
+        cleanup_stale_scratch(parent);
         let path = parent.join(format!(".import-{}", Uuid::new_v4()));
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)
             .map_err(|_| "Could not create a private import directory")?;
         Ok(Self { path })
+    }
+}
+
+/// A killed worker cannot run `Drop`; clear only scratch directories whose
+/// names match the UUID format this module creates.
+fn cleanup_stale_scratch(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(id) = name.strip_prefix(".import-") else {
+            continue;
+        };
+        if Uuid::parse_str(id).is_err() {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
     }
 }
 
@@ -623,6 +646,23 @@ mod tests {
         let link = temp.path().join("Bookmarks");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(read(&chromium_source(link), temp.path()).is_err());
+    }
+
+    #[test]
+    fn stale_import_scratch_is_removed_but_unrelated_data_is_kept() {
+        let temp = tempdir().unwrap();
+        let stale = temp
+            .path()
+            .join(".import-00000000-0000-4000-8000-000000000000");
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join("places.sqlite"), b"private browser data").unwrap();
+        let unrelated = temp.path().join(".import-not-a-uuid");
+        fs::create_dir(&unrelated).unwrap();
+
+        let scratch = ScratchDir::create(temp.path()).unwrap();
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+        assert!(scratch.path.exists());
     }
 
     fn firefox_places(path: &Path) {

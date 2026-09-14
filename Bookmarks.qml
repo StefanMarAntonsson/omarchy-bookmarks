@@ -43,7 +43,11 @@ Item {
   property string mode: "search"
   property var editingBookmark: null
   property string statusMessage: ""
+  property int formSaveRequestId: 0
+  property int deleteRequestId: 0
   property int metadataRequestId: 0
+  property var metadataRequests: ({})
+  property var suggestionRequests: ({})
   property bool titleEdited: false
   property bool descriptionEdited: false
   property bool applyingMetadata: false
@@ -113,8 +117,9 @@ Item {
     Qt.callLater(function() { searchField.forceActiveFocus() })
   }
   function close() { opened = false; query = ""; searchField.text = ""; results = []; defaultResults = []; selectedIndex = -1; pendingSelectionIndex = -1; noResultsState = false; previewingSelection = false; editingPreviewUrl = false; openUrlRequestId = 0; addUrlRequestId = 0; pendingAddUrl = ""; mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false; noticeMessage = ""; importPreview = null; pendingLibraryAction = null; if (!libraryBusy) libraryItems = [] }
-  // Setup runs in a visible terminal so its verification result can be read;
-  // reopening the overlay starts the newly installed worker.
+  // Setup runs in a visible terminal so its verification result can be read.
+  // Once that terminal closes, return to the overlay and either start the
+  // installed worker or show the setup error again.
   function startWorkerSetup() {
     if (!worker.setupRequired || workerSetup.running) return
     workerSetup.running = true
@@ -154,6 +159,7 @@ Item {
     Qt.callLater(function() { settingsKeyCatcher.forceActiveFocus() })
   }
   function saveSettings() {
+    if (settingsSaveRequestId) return
     statusMessage = "Saving settings…"
     settingsSaveRequestId = worker.request({
       type: "save_settings",
@@ -166,6 +172,87 @@ Item {
       }
     })
     if (!settingsSaveRequestId) statusMessage = worker.error || "Worker is unavailable"
+  }
+  function settingsFocusRows() {
+    var controls = []
+    function collect(item) {
+      if (!item) return
+      if (item !== settingsPanel && item.focusable === true && item.visible && item.enabled) {
+        var position = item.mapToItem(settingsPanel, 0, 0)
+        controls.push({
+          item: item,
+          left: position.x,
+          right: position.x + item.width,
+          top: position.y,
+          bottom: position.y + item.height,
+          centerX: position.x + item.width / 2
+        })
+      }
+      var childItems = item.children
+      for (var i = 0; i < childItems.length; ++i) collect(childItems[i])
+    }
+    collect(settingsPanel)
+    controls.sort(function(a, b) {
+      if (a.top !== b.top) return a.top - b.top
+      return a.left - b.left
+    })
+
+    var rows = []
+    for (var controlIndex = 0; controlIndex < controls.length; ++controlIndex) {
+      var control = controls[controlIndex]
+      var row = rows.length ? rows[rows.length - 1] : null
+      if (!row || control.top >= row.bottom - 1 || control.bottom <= row.top + 1) {
+        row = {top: control.top, bottom: control.bottom, controls: []}
+        rows.push(row)
+      } else {
+        row.top = Math.min(row.top, control.top)
+        row.bottom = Math.max(row.bottom, control.bottom)
+      }
+      row.controls.push(control)
+    }
+    for (var rowIndex = 0; rowIndex < rows.length; ++rowIndex) {
+      rows[rowIndex].controls.sort(function(a, b) { return a.left - b.left })
+    }
+    return rows
+  }
+  function moveSettingsFocus(horizontalDelta, verticalDelta) {
+    var rows = settingsFocusRows()
+    if (!rows.length) return
+    var currentRow = -1
+    var currentColumn = -1
+    for (var rowIndex = 0; rowIndex < rows.length; ++rowIndex) {
+      for (var columnIndex = 0; columnIndex < rows[rowIndex].controls.length; ++columnIndex) {
+        if (rows[rowIndex].controls[columnIndex].item.activeFocus) {
+          currentRow = rowIndex
+          currentColumn = columnIndex
+          break
+        }
+      }
+      if (currentRow >= 0) break
+    }
+    if (currentRow < 0) {
+      rows[0].controls[0].item.forceActiveFocus()
+      return
+    }
+
+    var target
+    if (horizontalDelta !== 0) {
+      var currentControls = rows[currentRow].controls
+      var wrappedColumn = (currentColumn + horizontalDelta + currentControls.length) % currentControls.length
+      target = currentControls[wrappedColumn]
+    } else {
+      var targetRow = currentRow + verticalDelta
+      if (targetRow < 0 || targetRow >= rows.length) return
+      var sourceX = rows[currentRow].controls[currentColumn].centerX
+      var targetControls = rows[targetRow].controls
+      target = targetControls[0]
+      for (var targetIndex = 1; targetIndex < targetControls.length; ++targetIndex) {
+        if (Math.abs(targetControls[targetIndex].centerX - sourceX) < Math.abs(target.centerX - sourceX)) {
+          target = targetControls[targetIndex]
+        }
+      }
+    }
+    target.item.forceActiveFocus()
   }
   function requestBrowsers() {
     var requestId = worker.request({type: "browsers"})
@@ -230,12 +317,15 @@ Item {
     if (index < 0 || index >= results.length) return
     previewingSelection = false; editingPreviewUrl = false; selectedIndex = index; activateCurrent(false)
   }
-  function requestOpenUrl(url, invertOpeningPreference, browserId) {
+  function requestOpen(body) {
     if (openUrlRequestId) return
     statusMessage = ""
-    var useNewWindow = invertOpeningPreference ? !openInNewWindow : openInNewWindow
-    openUrlRequestId = worker.request({type: "open_url", url: String(url || "").trim(), new_window: browserId ? false : useNewWindow, browser_id: browserId ? String(browserId) : null})
+    openUrlRequestId = worker.request(body)
     if (!openUrlRequestId) statusMessage = worker.error || "Worker is unavailable"
+  }
+  function requestOpenUrl(url, invertOpeningPreference, browserId) {
+    var useNewWindow = invertOpeningPreference ? !openInNewWindow : openInNewWindow
+    requestOpen({type: "open_url", url: String(url || "").trim(), new_window: browserId ? false : useNewWindow, browser_id: browserId ? String(browserId) : null})
   }
   function activateCurrent(invertOpeningPreference) {
     if (editingPreviewUrl) { requestOpenUrl(searchField.text, invertOpeningPreference, null); return }
@@ -255,7 +345,7 @@ Item {
     var item = selectedResult(); if (!item) return
     if (item.action === "open_url") { requestOpenUrl(item.url, invertOpeningPreference, null); return }
     var useNewWindow = invertOpeningPreference ? !openInNewWindow : openInNewWindow
-    worker.request({type: "open", bookmark_id: item.id, new_window: useNewWindow}); dismiss()
+    requestOpen({type: "open", bookmark_id: item.id, new_window: useNewWindow})
   }
   function activateCurrentInBrowser(browserId) {
     if (editingPreviewUrl) { requestOpenUrl(searchField.text, false, browserId); return }
@@ -266,13 +356,10 @@ Item {
     }
     if (item.action === "open_url") { requestOpenUrl(item.url, false, browserId); return }
     if (item.action) return
-    worker.request({type: "open", bookmark_id: item.id, new_window: false, browser_id: String(browserId)}); dismiss()
+    requestOpen({type: "open", bookmark_id: item.id, new_window: false, browser_id: String(browserId)})
   }
   function requestOpenUrlInAllBrowsers(url) {
-    if (openUrlRequestId) return
-    statusMessage = ""
-    openUrlRequestId = worker.request({type: "open_url_all", url: String(url || "").trim()})
-    if (!openUrlRequestId) statusMessage = worker.error || "Worker is unavailable"
+    requestOpen({type: "open_url_all", url: String(url || "").trim()})
   }
   function activateCurrentInAllBrowsers() {
     if (editingPreviewUrl) { requestOpenUrlInAllBrowsers(searchField.text); return }
@@ -283,7 +370,7 @@ Item {
     }
     if (item.action === "open_url") { requestOpenUrlInAllBrowsers(item.url); return }
     if (item.action) return
-    worker.request({type: "open_all", bookmark_id: item.id}); dismiss()
+    requestOpen({type: "open_all", bookmark_id: item.id})
   }
   function requestAddCurrentUrl() {
     if (addUrlRequestId) return
@@ -294,14 +381,19 @@ Item {
     if (!addUrlRequestId) statusMessage = worker.error || "Worker is unavailable"
   }
   function beginAdd(url) {
+    metadataRequestId++
     editingBookmark = null; mode = "form"; applyingMetadata = true
     urlField.text = url || ""; titleField.text = ""; descriptionField.text = ""; tagsField.text = ""
     applyingMetadata = false; titleEdited = false; descriptionEdited = false; suggestedTags = []; statusMessage = ""
     Qt.callLater(function() { (url ? titleField : urlField).forceActiveFocus() })
-    if (url && fetchPageDetails) { metadataRequestId++; worker.request({type: "fetch_metadata", url: url, metadata_request_id: metadataRequestId}) }
+    if (url && fetchPageDetails) {
+      var requestId = worker.request({type: "fetch_metadata", url: url, metadata_request_id: metadataRequestId})
+      if (requestId) metadataRequests[requestId] = metadataRequestId
+    }
   }
   function beginEdit() {
     var item = selectedResult(); if (!item || item.action) return
+    metadataRequestId++
     editingBookmark = item; mode = "form"; applyingMetadata = true
     urlField.text = item.originalUrl; titleField.text = item.title; descriptionField.text = item.description || ""
     tagsField.text = (item.tags || []).join(", "); applyingMetadata = false
@@ -309,10 +401,13 @@ Item {
     Qt.callLater(function() { titleField.forceActiveFocus(); titleField.selectAll() })
   }
   function saveForm() {
+    if (formSaveRequestId) return
     var tags = tagsField.text.split(",").map(function(value) { return value.trim() }).filter(Boolean)
     var bookmark = {id: editingBookmark ? editingBookmark.id : "", url: urlField.text, title: titleField.text,
       description: descriptionField.text, tags: tags, keyword: editingBookmark ? (editingBookmark.keyword || "") : ""}
-    if (!worker.request({type: editingBookmark ? "edit" : "add", bookmark: bookmark})) statusMessage = worker.error || "Worker is unavailable"
+    statusMessage = "Saving bookmark…"
+    formSaveRequestId = worker.request({type: editingBookmark ? "edit" : "add", bookmark: bookmark})
+    if (!formSaveRequestId) statusMessage = worker.error || "Worker is unavailable"
   }
   function returnToSettings() {
     mode = "settings"; importPreview = null; pendingLibraryAction = null
@@ -322,7 +417,7 @@ Item {
   function libraryRequest(body) {
     if (libraryBusy) return
     statusMessage = ""; noticeMessage = ""
-    libraryRequestId = worker.request(body)
+    libraryRequestId = worker.request(body, worker.libraryRequestTimeoutMs)
     libraryBusy = libraryRequestId !== 0
     if (!libraryRequestId) statusMessage = worker.error || "Worker is unavailable"
   }
@@ -432,15 +527,36 @@ Item {
     if (mode === "import") return importPreview ? (importPreview.counts.new ? "Import" : "Done") : "Preview"
     return "Restore…"
   }
-  function cancelSecondary() { mode = "search"; editingBookmark = null; statusMessage = ""; Qt.callLater(function() { searchField.forceActiveFocus() }) }
+  function cancelSecondary() {
+    if ((mode === "form" && formSaveRequestId) || (mode === "settings" && settingsSaveRequestId) || (mode === "delete" && deleteRequestId)) return
+    metadataRequestId++
+    mode = "search"; editingBookmark = null; statusMessage = ""
+    Qt.callLater(function() { searchField.forceActiveFocus() })
+  }
   function requestDelete() { var item = selectedResult(); if (item && !item.action) { editingBookmark = item; mode = "delete"; Qt.callLater(function(){ deleteKeyCatcher.forceActiveFocus() }) } }
+  function confirmDelete() {
+    if (deleteRequestId || !editingBookmark) return
+    deleteRequestId = worker.request({type: "delete", bookmark_id: editingBookmark.id})
+    if (!deleteRequestId) statusMessage = worker.error || "Worker is unavailable"
+  }
   function domain(url) { var match = String(url || "").match(/^https?:\/\/([^/]+)(\/.*)?$/i); return match ? match[1] + ((match[2] && match[2] !== "/") ? match[2] : "") : String(url || "") }
   function handleMessage(response) {
+    var metadataGeneration = metadataRequests[response.id]
+    var suggestionGeneration = suggestionRequests[response.id]
     if (!response.ok) {
+      if (metadataGeneration !== undefined) {
+        delete metadataRequests[response.id]
+        if (Number(metadataGeneration) === metadataRequestId && mode === "form") statusMessage = String(response.error || "Could not fetch page details")
+        return
+      }
+      if (suggestionGeneration !== undefined) { delete suggestionRequests[response.id]; return }
       if (libraryRequestId && response.id === libraryRequestId) { libraryRequestId = 0; libraryBusy = false; statusMessage = String(response.error || "Library operation failed"); return }
       if (openUrlRequestId && response.id === openUrlRequestId) { openUrlRequestId = 0; statusMessage = String(response.error || "Could not open URL"); return }
       if (addUrlRequestId && response.id === addUrlRequestId) { addUrlRequestId = 0; pendingAddUrl = ""; statusMessage = String(response.error || "Enter a valid HTTP or HTTPS URL"); return }
-      if (response.id === settingsRequestId || response.id === settingsSaveRequestId) { statusMessage = String(response.error || "Could not load settings"); return }
+      if (formSaveRequestId && response.id === formSaveRequestId) { formSaveRequestId = 0; statusMessage = String(response.error || "Could not save bookmark"); return }
+      if (deleteRequestId && response.id === deleteRequestId) { deleteRequestId = 0; statusMessage = String(response.error || "Could not delete bookmark"); return }
+      if (response.id === settingsRequestId) { statusMessage = String(response.error || "Could not load settings"); return }
+      if (settingsSaveRequestId && response.id === settingsSaveRequestId) { settingsSaveRequestId = 0; statusMessage = String(response.error || "Could not save settings"); return }
       if (response.id === browsersRequestId) { browsersLoading = false; browsersError = String(response.error || "Could not find browsers"); return }
       if (response.id === latestSearchId) { searchLoading = false; results = []; noResultsState = false }
       statusMessage = String(response.error || "Bookmark operation failed"); return
@@ -474,6 +590,7 @@ Item {
       return
     }
     if (response.id === settingsSaveRequestId) {
+      settingsSaveRequestId = 0
       applySettings(result.settings)
       searchScope = defaultSearchScope
       mode = "search"
@@ -512,16 +629,32 @@ Item {
       }
       return
     }
-    if (result.metadataRequestId !== undefined) {
-      if (Number(result.metadataRequestId) !== metadataRequestId || mode !== "form") return
+    if (metadataGeneration !== undefined) {
+      delete metadataRequests[response.id]
+      if (Number(metadataGeneration) !== metadataRequestId || Number(result.metadataRequestId) !== metadataRequestId || mode !== "form") return
       applyingMetadata = true
       if (!titleEdited && result.metadata && result.metadata.title) titleField.text = result.metadata.title
       if (!descriptionEdited && result.metadata && result.metadata.description) descriptionField.text = result.metadata.description
-      applyingMetadata = false; worker.request({type: "suggest_tags", text: titleField.text + " " + descriptionField.text}); return
+      applyingMetadata = false
+      var suggestionId = worker.request({type: "suggest_tags", text: titleField.text + " " + descriptionField.text})
+      if (suggestionId) suggestionRequests[suggestionId] = metadataRequestId
+      return
     }
-    if (Array.isArray(result.tags) && mode === "form") { suggestedTags = result.tags.slice(0, 4); return }
-    if (result.bookmark && mode === "form") { previewingSelection = false; editingPreviewUrl = false; cancelSecondary(); query = result.bookmark.title || result.bookmark.originalUrl; searchField.text = query; searchDebounce.restart(); return }
-    if (result.deleted) { mode = "search"; editingBookmark = null; restoreSearchQuery(); performSearch() }
+    if (suggestionGeneration !== undefined) {
+      delete suggestionRequests[response.id]
+      if (Number(suggestionGeneration) === metadataRequestId && mode === "form" && Array.isArray(result.tags)) suggestedTags = result.tags.slice(0, 4)
+      return
+    }
+    if (formSaveRequestId && response.id === formSaveRequestId) {
+      formSaveRequestId = 0
+      if (result.bookmark && mode === "form") { previewingSelection = false; editingPreviewUrl = false; cancelSecondary(); query = result.bookmark.title || result.bookmark.originalUrl; searchField.text = query; searchDebounce.restart() }
+      return
+    }
+    if (deleteRequestId && response.id === deleteRequestId) {
+      deleteRequestId = 0
+      if (result.deleted) { mode = "search"; editingBookmark = null; restoreSearchQuery(); performSearch() }
+      else statusMessage = "Bookmark no longer exists"
+    }
   }
 
   component ResultShortcutContent: Item {
@@ -724,6 +857,10 @@ Item {
   Process {
     id: workerSetup
     command: ["omarchy-launch-tui", "--app-id=TUI.float", root.workerInstaller, "--pause"]
+    onExited: function() {
+      if (root.shell && typeof root.shell.summon === "function")
+        Qt.callLater(function() { root.shell.summon(root.pluginId, "{}") })
+    }
   }
 
   PanelWindow {
@@ -867,8 +1004,38 @@ Item {
           Keys.onReleased: function(event) { root.updateModifierState(event, false) }
         }
         Column {
+          id: emptyLibraryPrompt
+          visible: root.mode === "search" && root.query.trim().length === 0
+            && !worker.setupRequired && worker.ready && !root.searchLoading
+            && root.results.length === 0
+          width: parent.width; spacing: Style.spacing.sm
+          topPadding: Style.spacing.sm; bottomPadding: Style.spacing.sm
+          Text {
+            width: parent.width; textFormat: Text.PlainText
+            text: "Your bookmark library is empty"
+            color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading
+          }
+          Text {
+            width: parent.width; textFormat: Text.PlainText; wrapMode: Text.Wrap
+            text: "Add your first bookmark, import from an installed browser, or load examples to explore Bookmarks."
+            color: Color.menu.text; opacity: 0.6; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+          }
+          Flow {
+            width: parent.width; spacing: Style.spacing.sm
+            Button { width: Style.space(140); height: Style.space(34); text: "Add bookmark"; bordered: true; selected: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.beginAdd("") }
+            Button { width: Style.space(170); height: Style.space(34); text: "Import from browser"; bordered: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.beginImport() }
+            Button { width: Style.space(140); height: Style.space(34); text: "Load examples"; bordered: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.confirmLoadExamples() }
+          }
+          Text {
+            width: parent.width; textFormat: Text.PlainText
+            text: "Keyboard: Ctrl+N adds · Ctrl+S opens settings and library tools"
+            color: Color.menu.text; opacity: 0.45; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+          }
+        }
+        Column {
           id: topBookmarks
-          visible: root.mode === "search" && root.query.trim().length === 0 && !worker.setupRequired
+          visible: root.mode === "search" && root.query.trim().length === 0
+            && !worker.setupRequired && root.results.length > 0
           width: parent.width; height: root.resultWindowHeight; spacing: Style.spacing.xs
           Repeater {
             model: root.results
@@ -964,7 +1131,7 @@ Item {
           }
           Text {
             width: parent.width; textFormat: Text.PlainText; wrapMode: Text.Wrap
-            text: "Setup opens a terminal. It installs the worker release pinned by this plugin after checking its SHA-256, or builds the plugin's own source with cargo when no release matches."
+            text: "Setup opens a terminal. It installs the worker release pinned by this plugin after checking its SHA-256, or builds the plugin's own source with cargo when no release matches. Bookmarks returns when the terminal closes."
             color: Color.menu.text; opacity: 0.6; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
           }
           Item {
@@ -1002,16 +1169,22 @@ Item {
             Text { textFormat: Text.PlainText; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; text: "Enter to save"; color: Color.menu.text; opacity: 0.45; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
             Row {
               anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: Style.spacing.sm
-              Button { width: Style.space(88); height: Style.space(34); text: "Cancel"; bordered: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.cancelSecondary() }
-              Button { width: Style.space(88); height: Style.space(34); text: root.editingBookmark ? "Save" : "Add"; bordered: true; selected: true; focusable: true; enabled: urlField.text.trim().length > 0; opacity: enabled ? 1 : 0.42; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.saveForm() }
+              Button { width: Style.space(88); height: Style.space(34); text: "Cancel"; bordered: true; focusable: true; enabled: !root.formSaveRequestId; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.cancelSecondary() }
+              Button { width: Style.space(88); height: Style.space(34); text: root.formSaveRequestId ? "Saving…" : root.editingBookmark ? "Save" : "Add"; bordered: true; selected: true; focusable: true; enabled: !root.formSaveRequestId && urlField.text.trim().length > 0; opacity: enabled ? 1 : 0.42; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.saveForm() }
             }
           }
         }
         Column {
+          id: settingsPanel
           visible: root.mode === "settings"; width: parent.width; spacing: Style.spacing.md
+          Keys.priority: Keys.BeforeItem
           Keys.onPressed: function(event) {
             if (event.key === Qt.Key_Escape) { root.cancelSecondary(); event.accepted = true }
             else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && event.modifiers === Qt.ControlModifier) { root.saveSettings(); event.accepted = true }
+            else if (event.modifiers === Qt.NoModifier && event.key === Qt.Key_Left) { root.moveSettingsFocus(-1, 0); event.accepted = true }
+            else if (event.modifiers === Qt.NoModifier && event.key === Qt.Key_Right) { root.moveSettingsFocus(1, 0); event.accepted = true }
+            else if (event.modifiers === Qt.NoModifier && event.key === Qt.Key_Up) { root.moveSettingsFocus(0, -1); event.accepted = true }
+            else if (event.modifiers === Qt.NoModifier && event.key === Qt.Key_Down) { root.moveSettingsFocus(0, 1); event.accepted = true }
           }
 
           Text {
@@ -1100,8 +1273,8 @@ Item {
             Text { textFormat: Text.PlainText; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; text: "Ctrl+Enter to save · Escape to cancel"; color: Color.menu.text; opacity: 0.45; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
             Row {
               anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: Style.spacing.sm
-              Button { width: Style.space(88); height: Style.space(34); text: "Cancel"; bordered: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.cancelSecondary() }
-              Button { width: Style.space(88); height: Style.space(34); text: "Save"; bordered: true; selected: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.saveSettings() }
+              Button { width: Style.space(88); height: Style.space(34); text: "Cancel"; bordered: true; focusable: true; enabled: !root.settingsSaveRequestId; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.cancelSecondary() }
+              Button { width: Style.space(88); height: Style.space(34); text: root.settingsSaveRequestId ? "Saving…" : "Save"; bordered: true; selected: true; focusable: true; enabled: !root.settingsSaveRequestId; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.saveSettings() }
             }
           }
         }
@@ -1143,13 +1316,15 @@ Item {
                 anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md; spacing: Style.spacing.xs
                 Text {
                   width: parent.width; textFormat: Text.PlainText; elide: Text.ElideRight
-                  text: root.mode === "import" ? modelData.browser : root.formatBackupTime(modelData.createdAt) + "  ·  " + root.backupReasonLabel(modelData.reason)
+                  text: root.mode === "import"
+                    ? String(modelData.browser || "")
+                    : root.formatBackupTime(Number(modelData.createdAt || 0)) + "  ·  " + root.backupReasonLabel(String(modelData.reason || ""))
                   color: index === root.libraryIndex ? Color.menu.selectedText : Color.menu.text
                   font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium
                 }
                 Text {
                   width: parent.width; textFormat: Text.PlainText; elide: Text.ElideRight
-                  text: root.mode === "import" ? modelData.profile : root.bookmarkCount(modelData.bookmarks)
+                  text: root.mode === "import" ? String(modelData.profile || "") : root.bookmarkCount(Number(modelData.bookmarks || 0))
                   color: Color.menu.text; opacity: 0.52; font.family: Style.font.menuFamily; font.pixelSize: Style.font.bodySmall
                 }
               }
@@ -1174,7 +1349,7 @@ Item {
           visible: root.mode === "delete"; width: parent.width; spacing: Style.spacing.md
           Text { textFormat: Text.PlainText; width: parent.width; text: "Delete “" + (root.editingBookmark ? (root.editingBookmark.title || root.domain(root.editingBookmark.originalUrl)) : "") + "”?"; color: Color.menu.text; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading }
           Text { textFormat: Text.PlainText; width: parent.width; text: "Enter confirms · Escape cancels"; color: Color.menu.text; opacity: 0.5; font.family: Style.font.menuFamily }
-          Item { id: deleteKeyCatcher; width: 1; height: 1; Keys.onPressed: function(e){if(e.key===Qt.Key_Escape){root.cancelSecondary();e.accepted=true}else if((e.key===Qt.Key_Return||e.key===Qt.Key_Enter)&&root.editingBookmark){worker.request({type:"delete",bookmark_id:root.editingBookmark.id});e.accepted=true}} }
+          Item { id: deleteKeyCatcher; width: 1; height: 1; Keys.onPressed: function(e){if(e.key===Qt.Key_Escape){root.cancelSecondary();e.accepted=true}else if(e.key===Qt.Key_Return||e.key===Qt.Key_Enter){root.confirmDelete();e.accepted=true}} }
         }
         Text { textFormat: Text.PlainText; visible: Boolean(root.noticeMessage) && !root.statusMessage; width: parent.width; text: root.noticeMessage; color: Color.menu.text; opacity: 0.72; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
         Text { textFormat: Text.PlainText; visible: Boolean(root.statusMessage || (worker.error && !worker.setupRequired)); width: parent.width; text: root.statusMessage || worker.error; color: Color.urgent; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }

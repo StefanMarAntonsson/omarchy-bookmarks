@@ -11,14 +11,115 @@ those rows after typing in a scrollable three-to-ten-row
 window, according to the user's setting. Literal query matches are highlighted
 in result titles and URLs.
 
+![Bookmarks for Omarchy](preview.png)
+
+## Installation and first use
+
+Install and enable the plugin from GitHub:
+
+```bash
+omarchy plugin add https://github.com/StefanMarAntonsson/omarchy-bookmarks.git --enable
+```
+
+Enabling an overlay makes it available to Omarchy, but does not open it or add
+a launcher. Open it once with:
+
+```bash
+omarchy-shell shell summon stefanmara.bookmarks '{}'
+```
+
+On first open, press **Enter** or choose **Set up worker**. Setup runs in a
+visible terminal and explains whether it downloaded the worker pinned by this
+plugin or built the bundled source. Read the result and close the terminal;
+Bookmarks then returns automatically. An existing v1 library is migrated at
+this point. A new empty library offers **Add bookmark**, **Import from browser**,
+and **Load examples** as its first actions.
+
+### Choose how to open Bookmarks
+
+A main-menu entry is the recommended discoverable default. A keybinding is a
+useful optional shortcut. The plugin does not silently change either shared
+configuration file, so the choice and key combination remain yours.
+
+To add a main-menu entry, edit
+`~/.config/omarchy/extensions/omarchy-menu.jsonc` and add the following property
+inside its outermost object (include a comma between it and another property):
+
+```jsonc
+"stefanmara-bookmarks": {
+  "icon": "",
+  "label": "Bookmarks",
+  "action": "omarchy-shell shell summon stefanmara.bookmarks '{}'",
+  "when": "omarchy plugin list --json 2>/dev/null | jq -e 'any(.[]; .id == \"stefanmara.bookmarks\" and .enabled == true)' >/dev/null"
+}
+```
+
+Omarchy watches that file, so a valid edit appears without a restart. If the
+file is new, wrap the property in `{` and `}`. Removing that property removes
+the entry.
+
+For a direct shortcut, first review the existing bindings with
+`omarchy-menu-keybindings`, then add an unused combination to
+`~/.config/hypr/bindings.lua`, for example:
+
+```lua
+o.bind(
+  "SUPER + B",
+  "Bookmarks",
+  "omarchy-shell shell summon stefanmara.bookmarks '{}'"
+)
+```
+
+Hyprland reloads this file automatically. Replace `SUPER + B` if it is already
+assigned.
+
+## Upgrading from v1
+
+The move from v1.0.4 to v2 is a major upgrade, but it does not require an
+export. Update the existing Git-managed installation with:
+
+```bash
+omarchy plugin update stefanmara.bookmarks
+```
+
+Then open Bookmarks and complete **Set up worker** as described above. On the
+first successful v2 worker start, the version-3
+`bookmarks.json` used by v1 is validated and migrated to SQLite. IDs, URLs,
+titles, tags, keywords, usage scores, and last-opened times are retained. The
+original JSON remains untouched and a private timestamped migration backup is
+created before anything is imported.
+
+The stable plugin ID is unchanged. Existing v1 main-menu entries and direct
+keybindings therefore continue to open v2 on supported Omarchy versions.
+These intentional behavior changes are worth knowing:
+
+- Favicons are not imported or displayed. The rest of an entry containing a
+  valid v1 favicon still migrates.
+- The old `settings.json` is left in place but is not imported. v2 starts with
+  its new defaults, including website detail fetching **off**, so an old
+  network opt-in never silently carries forward.
+- Keyword values remain searchable, but v1's parameterized keyword expansion
+  is not yet exposed in the v2 interface.
+- `Ctrl+S` now opens all settings and library actions. Import is under
+  **Settings → Library**, deletion is `Ctrl+D`, and adding a URL is `Ctrl+N`.
+  The old `Ctrl+M`, `Ctrl+I`, `Ctrl+V`, `Ctrl+,`, and plain `Delete` behaviors
+  are not carried forward.
+
+Do not use v1 to make changes after v2 has migrated the library. v1 writes the
+preserved JSON while v2 writes SQLite, and the two stores are not synchronized;
+v1 changes made after migration will not appear in v2. If a rollback is
+necessary, treat it as a data restore and keep copies of both stores rather
+than switching versions back and forth.
+
 ## Architecture
 
 - `Bookmarks.qml` owns presentation, focus, keyboard handling, bounded result
   rows, selection previews in the input, and compact edit/delete modes.
 - `WorkerClient.qml` owns one managed child process, version-1 newline-delimited
-  JSON framing, response validation, and stale-response IDs. Every request has a
-  20-second deadline; a worker that stops responding is terminated and every
-  outstanding request is resolved with an error. Crashes after a successful
+  JSON framing, response validation, and stale-response IDs. Ordinary requests
+  have a 20-second deadline and explicit library operations have a two-minute
+  deadline; a worker that stops responding is terminated and every outstanding
+  request is resolved with an error. Crashes after a successful
   handshake restart with bounded exponential backoff (at most five times until
   the overlay is reopened); startup failures are reported and not retried in a
   loop.
@@ -56,11 +157,11 @@ does not create, modify, or manage services. Launched helpers are waited on so
 the long-running worker does not accumulate zombie processes. URLs, including
 stored ones, are validated as HTTP(S) immediately before every launch.
 
-Setup uses `sha256sum`, `flock`, and `curl` for a pinned release, or a Rust
-toolchain (`cargo`) when building from source, and `omarchy-launch-tui` to show
-its terminal.
+Setup uses `sha256sum`, `flock`, and `curl` for a pinned release, or a Rust 1.96
+or newer toolchain (`cargo`) when building from source, and
+`omarchy-launch-tui` to show its terminal.
 
-## Installing the worker
+## Worker setup and verification
 
 The plugin contains no executable. The first time Bookmarks opens without a
 worker, it shows **Set up worker**. Pressing Enter opens a terminal running
@@ -84,7 +185,9 @@ worker, it shows **Set up worker**. Pressing Enter opens a terminal running
    locations and concurrent runs.
 
 Setup only runs when you ask for it; loading the plugin never downloads or
-builds anything. Reopen Bookmarks after setup finishes.
+builds anything. After the setup terminal closes, the overlay returns and
+starts the newly installed worker. If setup failed, it returns to the setup
+prompt so you can retry after addressing the terminal's error.
 
 `worker-launcher.sh` starts the worker only when the installed executable's
 hash matches its record and the record's source fingerprint matches this
@@ -92,6 +195,9 @@ checkout's source (`scripts/worker-source-id.sh`: `Cargo.toml`, `Cargo.lock`,
 and every `.rs` file under `src/`). After a plugin update that changes the
 worker, or if the executable is modified, the overlay asks for setup again
 instead of running it.
+
+The data, backup, and worker-install directories are kept at mode 0700. The
+worker refuses a symlinked data directory rather than following it.
 
 To verify a release yourself:
 
@@ -113,6 +219,8 @@ pinned is described in [docs/RELEASING.md](docs/RELEASING.md).
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
+cargo audit
+shellcheck worker-launcher.sh tests/run scripts/*.sh
 ./tests/run
 omarchy plugin validate .
 ```
@@ -139,18 +247,6 @@ Open the enabled plugin with:
 
 ```bash
 omarchy-shell shell toggle stefanmara.bookmarks '{}'
-```
-
-## Hyprland shortcut
-
-In `~/.config/hypr/bindings.lua`:
-
-```lua
-o.bind(
-  "SUPER + B",
-  "Bookmarks",
-  "omarchy-shell shell toggle stefanmara.bookmarks '{}'"
-)
 ```
 
 ## Keyboard controls
@@ -185,6 +281,10 @@ contact its website to suggest a title and description. Changes are saved in
 the SQLite database and apply immediately after saving as well as on future
 launcher opens. Website lookups are off by default because they disclose the
 requested URL and the user's IP address to the destination.
+
+Within Settings, `Up` and `Down` move to the closest control in the adjacent
+row. `Left` and `Right` move within the current row and wrap at either end.
+Normal `Tab` and `Shift+Tab` focus traversal remains available.
 
 When page-detail fetching is enabled, metadata suggestions never block saving.
 A late response fills title or description only if the user has not edited that
@@ -230,12 +330,13 @@ schema, or it exceeds the store limits. Restores run in one transaction.
 Browser data is read without changing it. Chromium-family `Bookmarks` files
 are read directly. Firefox-family `places.sqlite` (and its write-ahead log) is
 copied into a private temporary directory, read there, and deleted, so a
-running browser is never affected. Files are opened without following
-symlinks and with size, entry-count, and folder-depth limits. The worker only
-reads a profile that its own discovery found; a request cannot name another
-file.
+running browser is never affected. UUID-named scratch directories left by a
+terminated worker are removed before the next import. Files are opened without
+following symlinks and with size, entry-count, and folder-depth limits. The
+worker only reads a profile that its own discovery found; a request cannot name
+another file.
 
-## Data, migration, and recovery
+## Data migration, rollback, and recovery
 
 SQLite is authoritative at:
 
@@ -248,6 +349,11 @@ The legacy source remains at:
 ```text
 $XDG_DATA_HOME/stefanmara.bookmarks/bookmarks.json
 ```
+
+A worker refuses to open a database with a newer SQLite schema before making
+any migration or WAL changes. This protects against running an older v2 worker
+against a database created by a future worker; it does not make a rollback to
+the JSON-based v1 plugin safe. See **Upgrading from v1** above.
 
 On the first worker start, when no successful migration is recorded, a valid
 legacy version-3 JSON file is opened without following symlinks or blocking
@@ -313,7 +419,8 @@ It supports Open Graph title/description, standard description metadata, and
 - Import reads installed browser profiles only; bookmark HTML export files and
   the old plugin JSON format cannot be imported. Browser folders are not turned
   into tags.
-- There is no Omarchy menu-entry installer or favicon support.
+- Main-menu integration is a documented manual opt-in; the plugin does not
+  edit shared Omarchy configuration. Favicons are not supported.
 
 ## Performance
 

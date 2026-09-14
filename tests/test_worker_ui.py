@@ -32,6 +32,19 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn("!root.query.trim() && event.key === Qt.Key_Up", self.ui)
         self.assertIn("!root.query.trim() && event.key === Qt.Key_Down", self.ui)
 
+    def test_empty_library_explains_the_first_use_choices(self):
+        self.assertIn("id: emptyLibraryPrompt", self.ui)
+        self.assertIn("worker.ready && !root.searchLoading", self.ui)
+        self.assertIn("root.results.length === 0", self.ui)
+        self.assertIn('text: "Your bookmark library is empty"', self.ui)
+        self.assertIn('text: "Add bookmark"', self.ui)
+        self.assertIn('onClicked: root.beginAdd("")', self.ui)
+        self.assertIn('text: "Import from browser"', self.ui)
+        self.assertIn("onClicked: root.beginImport()", self.ui)
+        self.assertIn('text: "Load examples"', self.ui)
+        self.assertIn("onClicked: root.confirmLoadExamples()", self.ui)
+        self.assertIn("!worker.setupRequired && root.results.length > 0", self.ui)
+
     def test_search_input_aligns_with_result_titles(self):
         self.assertIn(
             "leftPadding: Style.spacing.md; rightPadding: Style.spacing.md",
@@ -174,6 +187,12 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn('type: "open_all"', self.ui)
         self.assertIn('type: "open_url_all"', self.ui)
 
+    def test_open_failures_remain_visible_before_the_overlay_closes(self):
+        self.assertIn("function requestOpen(body)", self.ui)
+        self.assertIn("openUrlRequestId = worker.request(body)", self.ui)
+        self.assertIn('statusMessage = String(response.error || "Could not open URL")', self.ui)
+        self.assertIn("if (openUrlRequestId && response.id === openUrlRequestId) { openUrlRequestId = 0; dismiss(); return }", self.ui)
+
     def test_nonempty_results_use_a_configurable_scrollable_viewport(self):
         self.assertIn("id: searchResults", self.ui)
         self.assertIn("resultWindowHeight: Style.space(58) * root.resultCount", self.ui)
@@ -208,6 +227,21 @@ class WorkerUiContractTests(unittest.TestCase):
         )
         self.assertIn('text: "In a new tab"', self.ui)
 
+    def test_settings_support_spatial_arrow_navigation_without_overriding_tab(self):
+        self.assertIn("function settingsFocusRows()", self.ui)
+        self.assertIn("function moveSettingsFocus(horizontalDelta, verticalDelta)", self.ui)
+        self.assertIn("item.mapToItem(settingsPanel, 0, 0)", self.ui)
+        self.assertIn("(currentColumn + horizontalDelta + currentControls.length) % currentControls.length", self.ui)
+        self.assertIn("Math.abs(targetControls[targetIndex].centerX - sourceX)", self.ui)
+        settings_start = self.ui.index("id: settingsPanel")
+        settings_end = self.ui.index("id: libraryPanel", settings_start)
+        settings_region = self.ui[settings_start:settings_end]
+        self.assertIn("event.key === Qt.Key_Left", settings_region)
+        self.assertIn("event.key === Qt.Key_Right", settings_region)
+        self.assertIn("event.key === Qt.Key_Up", settings_region)
+        self.assertIn("event.key === Qt.Key_Down", settings_region)
+        self.assertNotIn("event.key === Qt.Key_Tab", settings_region)
+
     def test_no_result_resize_commits_with_the_completed_response(self):
         self.assertNotIn("noResultsResizeDelay", self.ui)
         self.assertNotIn("compactNoResults", self.ui)
@@ -229,11 +263,26 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn("if (!descriptionEdited", self.ui)
         self.assertIn("Number(result.metadataRequestId) !== metadataRequestId", self.ui)
 
+    def test_metadata_and_tag_suggestions_cannot_leak_into_a_later_form(self):
+        self.assertIn("property var metadataRequests: ({})", self.ui)
+        self.assertIn("property var suggestionRequests: ({})", self.ui)
+        self.assertIn("metadataRequests[requestId] = metadataRequestId", self.ui)
+        self.assertIn("suggestionRequests[suggestionId] = metadataRequestId", self.ui)
+        self.assertIn("Number(metadataGeneration) !== metadataRequestId", self.ui)
+        self.assertIn("Number(suggestionGeneration) === metadataRequestId", self.ui)
+
+    def test_form_and_settings_saves_are_single_flight(self):
+        self.assertIn("property int formSaveRequestId: 0", self.ui)
+        self.assertIn("if (formSaveRequestId) return", self.ui)
+        self.assertIn("if (settingsSaveRequestId) return", self.ui)
+        self.assertIn('text: root.formSaveRequestId ? "Saving…"', self.ui)
+        self.assertIn('text: root.settingsSaveRequestId ? "Saving…"', self.ui)
+
     def test_edit_form_can_be_saved_from_keyboard_or_button(self):
         self.assertGreaterEqual(self.ui.count("onAccepted: root.saveForm()"), 3)
-        self.assertIn('text: root.editingBookmark ? "Save" : "Add"', self.ui)
+        self.assertIn('root.editingBookmark ? "Save" : "Add"', self.ui)
         self.assertIn("onClicked: root.saveForm()", self.ui)
-        self.assertIn("enabled: urlField.text.trim().length > 0", self.ui)
+        self.assertIn("urlField.text.trim().length > 0", self.ui)
 
     def test_tab_leaves_the_multiline_description_field(self):
         description_start = self.ui.index("id: descriptionField")
@@ -254,17 +303,33 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn("Math.min(10000", self.client)
         self.assertIn("root.restartAttempt >= root.maxAutomaticRestarts", self.client)
 
+    def test_worker_only_becomes_ready_after_a_successful_handshake(self):
+        started = self.client[self.client.index("onStarted:"):self.client.index("onExited:")]
+        hello = self.client[self.client.index("if (parsed.id === root.helloId"):self.client.index("if (parsed.id === 0")]
+        self.assertNotIn("root.ready = true", started)
+        self.assertIn('(!ready && body.type !== "hello")', self.client)
+        self.assertIn("root.handshakeComplete = true", hello)
+        self.assertIn("root.ready = true", hello)
+
     def test_startup_failures_do_not_restart_in_a_loop(self):
         self.assertIn("if (!wasRunning || root.restartAttempt >= root.maxAutomaticRestarts)", self.client)
         self.assertIn("root.handshakeComplete = true", self.client)
         self.assertIn("worker.start()", self.ui)
 
+    def test_worker_setup_returns_to_the_overlay_after_the_terminal_closes(self):
+        setup = self.ui[self.ui.index("id: workerSetup"):self.ui.index("PanelWindow {")]
+        self.assertIn("onExited: function()", setup)
+        self.assertIn('root.shell.summon(root.pluginId, "{}")', setup)
+        self.assertIn("Bookmarks returns when the terminal closes.", self.ui)
+
     def test_every_request_is_resolved_or_times_out(self):
-        self.assertIn("pending[id] = Date.now() + requestTimeoutMs", self.client)
+        self.assertIn("pending[id] = Date.now() + effectiveTimeout", self.client)
         self.assertIn("id: watchdog", self.client)
         self.assertIn('root.killReason = "Bookmark worker stopped responding"', self.client)
         self.assertIn("root.abandonPending(", self.client)
         self.assertIn("root.message({version: 1, id: Number(ids[i]), ok: false", self.client)
+        self.assertIn("readonly property int libraryRequestTimeoutMs: 120000", self.client)
+        self.assertIn("worker.request(body, worker.libraryRequestTimeoutMs)", self.ui)
 
     def test_worker_failure_releases_ready_state_and_restarts(self):
         self.assertIn("onExited", self.client)
@@ -279,7 +344,9 @@ class WorkerUiContractTests(unittest.TestCase):
     def test_delete_requires_explicit_confirmation(self):
         self.assertIn('mode = "delete"', self.ui)
         self.assertIn('text: "Enter confirms · Escape cancels"', self.ui)
-        self.assertIn('type:"delete",bookmark_id:root.editingBookmark.id', self.ui)
+        self.assertIn("function confirmDelete()", self.ui)
+        self.assertIn('type: "delete", bookmark_id: editingBookmark.id', self.ui)
+        self.assertIn("if (deleteRequestId || !editingBookmark) return", self.ui)
 
     def test_untrusted_titles_are_plain_text(self):
         position = self.ui.index("text: modelData.title || root.domain(modelData.originalUrl)")
@@ -308,6 +375,12 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn('text: "Library"', self.ui)
         self.assertIn("id: libraryPanel", self.ui)
 
+    def test_library_rows_never_assign_undefined_text(self):
+        self.assertIn('String(modelData.browser || "")', self.ui)
+        self.assertIn('String(modelData.profile || "")', self.ui)
+        self.assertIn('Number(modelData.createdAt || 0)', self.ui)
+        self.assertIn('Number(modelData.bookmarks || 0)', self.ui)
+
     def test_destructive_library_actions_require_confirmation(self):
         clear = self.ui[self.ui.index("function confirmClearLibrary()"):]
         clear = clear[:clear.index("\n  }")]
@@ -330,8 +403,8 @@ class WorkerUiContractTests(unittest.TestCase):
             self.ui,
         )
 
-    def test_default_view_has_no_toolbar_or_buttons(self):
-        search_start = self.ui.index("id: searchField")
+    def test_populated_default_view_has_no_toolbar_or_buttons(self):
+        search_start = self.ui.index("id: topBookmarks")
         results_start = self.ui.index('visible: root.mode === "search" && root.query.trim().length > 0')
         default_region = self.ui[search_start:results_start]
         self.assertNotIn("Controls.Button", default_region)

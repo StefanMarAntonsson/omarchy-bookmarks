@@ -2,6 +2,8 @@ use serde::Serialize;
 use std::{
     collections::HashSet,
     env, fs,
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -240,11 +242,23 @@ fn parse_desktop_file(path: &Path) -> Option<Browser> {
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Option<String> {
-    let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > limit {
+    // Validate and read through one descriptor. Reopening the path after a
+    // metadata check would allow a symlink swap or an unbounded replacement.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > limit {
         return None;
     }
-    fs::read_to_string(path).ok()
+    let mut raw = Vec::new();
+    file.take(limit + 1).read_to_end(&mut raw).ok()?;
+    if raw.len() as u64 > limit {
+        return None;
+    }
+    String::from_utf8(raw).ok()
 }
 
 #[cfg(test)]
@@ -290,5 +304,29 @@ mod tests {
             default_from_mimeapps(&path).as_deref(),
             Some("browser.desktop")
         );
+    }
+
+    #[test]
+    fn symlinked_desktop_and_mimeapps_files_are_not_read() {
+        let temp = tempdir().unwrap();
+        let real_desktop = temp.path().join("real");
+        fs::write(
+            &real_desktop,
+            "[Desktop Entry]\nName=Browser\nMimeType=x-scheme-handler/https;\n",
+        )
+        .unwrap();
+        let desktop = temp.path().join("browser.desktop");
+        std::os::unix::fs::symlink(&real_desktop, &desktop).unwrap();
+        assert!(parse_desktop_file(&desktop).is_none());
+
+        let real_mimeapps = temp.path().join("real-mimeapps");
+        fs::write(
+            &real_mimeapps,
+            "[Default Applications]\nx-scheme-handler/https=browser.desktop;\n",
+        )
+        .unwrap();
+        let mimeapps = temp.path().join("mimeapps.list");
+        std::os::unix::fs::symlink(&real_mimeapps, &mimeapps).unwrap();
+        assert!(default_from_mimeapps(&mimeapps).is_none());
     }
 }

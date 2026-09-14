@@ -15,7 +15,7 @@ export LC_ALL=C
 
 readonly repository="StefanMarAntonsson/omarchy-bookmarks"
 readonly workflow=".github/workflows/release.yml"
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd -- "$root"
 
 for tool in gh git sha256sum python3; do

@@ -87,20 +87,29 @@ fn valid_unbookmarked_url_is_marked_for_direct_opening() {
 }
 
 #[test]
-fn migrates_backs_up_and_is_idempotent() {
+fn migrates_public_v1_store_backs_up_and_is_idempotent() {
     let d = tempdir().unwrap();
     let json = d.path().join("bookmarks.json");
     let db = d.path().join("bookmarks.sqlite3");
-    legacy(
-        &json,
-        r#"{"version":3,"bookmarks":[{"id":"one","title":"One","url":"https://example.test/path?x=1#f","tags":["docs"],"keyword":"ex","usageScore":2.5,"lastOpenedAt":10}]}"#,
-    );
+    // Mirrors the version-3 shape written by the public v1.0.4 store. The
+    // favicon is intentionally present: v2 no longer renders favicons, but an
+    // otherwise valid v1 library must still migrate.
+    let original = r#"{"version":3,"bookmarks":[{"id":"one","title":"One","url":"https://example.test/path?x=1#f","tags":["docs","reference"],"keyword":"ex","favicon":"data:image/png;base64,iVBORw0KGgo=","usageScore":2.5,"lastOpenedAt":10}]}"#;
+    legacy(&json, original);
     {
         let r = Repository::open(&db, &json).unwrap();
         assert_eq!(r.all().len(), 1);
-        assert_eq!(r.all()[0].keyword, "ex");
+        let bookmark = &r.all()[0];
+        assert_eq!(bookmark.id, "one");
+        assert_eq!(bookmark.title, "One");
+        assert_eq!(bookmark.original_url, "https://example.test/path?x=1#f");
+        assert_eq!(bookmark.tags, ["docs", "reference"]);
+        assert_eq!(bookmark.keyword, "ex");
+        assert_eq!(bookmark.usage_score, 2.5);
+        assert_eq!(bookmark.last_opened_at, 10);
     }
     assert!(json.exists());
+    assert_eq!(fs::read_to_string(&json).unwrap(), original);
     assert_eq!(
         fs::read_dir(d.path())
             .unwrap()
@@ -509,6 +518,8 @@ fn database_files_are_private() {
     use std::os::unix::fs::PermissionsExt;
     let d = tempdir().unwrap();
     let db = d.path().join("data").join("bookmarks.sqlite3");
+    fs::create_dir(db.parent().unwrap()).unwrap();
+    fs::set_permissions(db.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
     {
         let mut r = Repository::open(&db, &d.path().join("none")).unwrap();
         r.add(input("", "https://one.test", "One")).unwrap();
@@ -522,6 +533,52 @@ fn database_files_are_private() {
     if wal.exists() {
         assert_eq!(mode(&wal), 0o600);
     }
+}
+
+#[test]
+fn newer_database_schema_is_refused_without_migration() {
+    let d = tempdir().unwrap();
+    let db = d.path().join("bookmarks.sqlite3");
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+             INSERT INTO schema_migrations VALUES(999, 0);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = Repository::open(&db, &d.path().join("none"))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("newer version"), "{error}");
+
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let bookmarks_table: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='bookmarks'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bookmarks_table, 0);
+}
+
+#[test]
+fn symlinked_data_directory_is_refused() {
+    let d = tempdir().unwrap();
+    let real = d.path().join("real-data");
+    fs::create_dir(&real).unwrap();
+    let linked = d.path().join("linked-data");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+
+    let error = Repository::open(&linked.join("bookmarks.sqlite3"), &linked.join("none"))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("symlinked data directory"), "{error}");
+    assert!(!real.join("bookmarks.sqlite3").exists());
 }
 
 #[test]

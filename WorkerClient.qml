@@ -21,6 +21,7 @@ Item {
   readonly property int maxLineCharacters: 256 * 1024
   readonly property int maxRequestBytes: 64 * 1024
   readonly property int requestTimeoutMs: 20000
+  readonly property int libraryRequestTimeoutMs: 120000
   readonly property int maxAutomaticRestarts: 5
 
   signal message(var response)
@@ -54,8 +55,11 @@ Item {
     return bytes
   }
 
-  function request(body) {
-    if (!worker.running || !ready)
+  function request(body, timeoutMs) {
+    // The hello request establishes protocol compatibility. Application
+    // requests wait for its response so startup and automatic restarts cannot
+    // race work ahead of the handshake.
+    if (!worker.running || (!ready && body.type !== "hello"))
       return 0
     var id = nextId++
     body.version = 1
@@ -65,7 +69,11 @@ Item {
       error = "Request is too large"
       return 0
     }
-    pending[id] = Date.now() + requestTimeoutMs
+    var effectiveTimeout = Number(timeoutMs || requestTimeoutMs)
+    if (!isFinite(effectiveTimeout) || effectiveTimeout < requestTimeoutMs)
+      effectiveTimeout = requestTimeoutMs
+    effectiveTimeout = Math.min(effectiveTimeout, libraryRequestTimeoutMs)
+    pending[id] = Date.now() + effectiveTimeout
     watchdog.start()
     worker.write(encoded + "\n")
     return id
@@ -119,6 +127,7 @@ Item {
         if (parsed.id === root.helloId && parsed.ok) {
           root.handshakeComplete = true
           root.setupRequired = false
+          root.ready = true
         }
         if (parsed.id === 0 && !parsed.ok) {
           root.error = String(parsed.error || "Worker failed")
@@ -128,7 +137,6 @@ Item {
       }
     }
     onStarted: {
-      root.ready = true
       root.error = ""
       root.helloId = root.request({type: "hello"})
     }

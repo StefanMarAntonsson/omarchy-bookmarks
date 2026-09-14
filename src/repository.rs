@@ -78,16 +78,14 @@ pub struct Repository {
 impl Repository {
     pub fn open(db_path: &Path, legacy_path: &Path) -> Result<Self, RepositoryError> {
         if let Some(parent) = db_path.parent() {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
+            ensure_private_data_dir(parent)?;
         }
         restrict_database_files(db_path)?;
         let conn = Connection::open_with_flags(
             db_path,
             OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        reject_newer_schema(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let mut this = Self {
@@ -457,6 +455,53 @@ impl Repository {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(())
     }
+}
+
+/// Refuse a database created by a newer worker before running any migrations
+/// or enabling WAL, both of which can write to the file.
+fn reject_newer_schema(conn: &Connection) -> Result<(), RepositoryError> {
+    let has_migrations: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_migrations {
+        return Ok(());
+    }
+    let version: i64 = conn.query_row(
+        "SELECT COALESCE(max(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if version > SCHEMA_VERSION {
+        return Err(RepositoryError::Validation(
+            "The bookmark database was created by a newer version of Bookmarks".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_private_data_dir(path: &Path) -> Result<(), RepositoryError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(RepositoryError::Validation(format!(
+            "Refusing to use a symlinked data directory: {}",
+            path.display()
+        )));
+    }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(RepositoryError::Validation(
+            "The bookmark data location is not a directory".into(),
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
 }
 
 fn validate_settings(settings: &UserSettings) -> Result<(), RepositoryError> {

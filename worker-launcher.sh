@@ -5,7 +5,7 @@
 
 set -eu
 
-plugin_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+plugin_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 case ${XDG_DATA_HOME:-} in
   /*) data_home=$XDG_DATA_HOME ;;
   *) data_home=$HOME/.local/share ;;

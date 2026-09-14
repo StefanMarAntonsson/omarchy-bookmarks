@@ -458,6 +458,14 @@ fn ensure_private_dir(path: &Path) -> Result<(), RepositoryError> {
         .recursive(true)
         .mode(0o700)
         .create(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(RepositoryError::Validation(format!(
+            "Refusing to use a non-directory path: {}",
+            path.display()
+        )));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 

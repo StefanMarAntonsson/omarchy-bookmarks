@@ -18,9 +18,10 @@ use reqwest::{
 use serde::Serialize;
 use url::{Host, Url};
 
+use crate::repository::{MAX_DESCRIPTION, MAX_TITLE};
+
 const MAX_BODY: usize = 1_000_000;
 const MAX_REDIRECTS: usize = 4;
-const MAX_FIELD_CHARS: usize = 2048;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,8 +118,8 @@ fn fetch_with(url: &str, policy: FetchPolicy) -> Result<Metadata, String> {
         .or_else(|| meta(&html, "name", "description"))
         .unwrap_or_default();
     Ok(Metadata {
-        title: decode(&title),
-        description: decode(&description),
+        title: decode(&title, MAX_TITLE),
+        description: decode(&description, MAX_DESCRIPTION),
         final_url: response.url().to_string(),
     })
 }
@@ -288,20 +289,23 @@ fn title_tag(html: &str) -> Option<String> {
         .captures(html)
         .map(|c| c[1].trim().to_string())
 }
-fn decode(value: &str) -> String {
-    let decoded = value
+fn decode(value: &str, max_bytes: usize) -> String {
+    let cleaned = value
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
-        .replace("&amp;", "&");
-    decoded
+        .replace("&amp;", "&")
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .take(MAX_FIELD_CHARS)
         .collect::<String>()
         .trim()
-        .to_string()
+        .to_string();
+    let mut end = cleaned.len().min(max_bytes);
+    while !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    cleaned[..end].to_string()
 }
 
 #[cfg(test)]
@@ -379,9 +383,12 @@ mod tests {
 
     #[test]
     fn decoded_fields_are_single_line_and_bounded() {
-        assert_eq!(decode("  a\r\nb&lt;i&gt;  "), "a  b<i>");
-        assert_eq!(decode("&amp;lt;"), "&lt;");
-        assert_eq!(decode(&"x".repeat(5000)).chars().count(), MAX_FIELD_CHARS);
+        assert_eq!(decode("  a\r\nb&lt;i&gt;  ", MAX_TITLE), "a  b<i>");
+        assert_eq!(decode("&amp;lt;", MAX_TITLE), "&lt;");
+        assert_eq!(decode(&"x".repeat(5000), MAX_TITLE).len(), MAX_TITLE);
+        let unicode = decode(&"🦀".repeat(MAX_TITLE), MAX_TITLE);
+        assert_eq!(unicode.len(), MAX_TITLE);
+        assert_eq!(unicode.chars().count(), MAX_TITLE / "🦀".len());
     }
 
     #[test]

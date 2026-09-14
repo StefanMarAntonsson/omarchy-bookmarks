@@ -19,7 +19,7 @@ readonly repository="StefanMarAntonsson/omarchy-bookmarks"
 readonly asset_prefix="omarchy-bookmarks-worker"
 readonly max_binary_bytes=$((64 * 1024 * 1024))
 
-plugin_dir=$(CDPATH= cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)
+plugin_dir=$(CDPATH='' cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)
 from_source=false
 pause=false
 for argument in "$@"; do
@@ -70,8 +70,9 @@ done
 # links that could redirect the write somewhere else.
 for directory in "$app_dir" "$install_dir"; do
   [[ -L $directory ]] && fail "Refusing to install through a symlink: $directory"
-  mkdir -p -m 700 -- "$directory"
+  mkdir -p -- "$directory"
   [[ -O $directory ]] || fail "Install directory is not owned by you: $directory"
+  chmod 700 -- "$directory"
 done
 [[ -L $binary || -L $record ]] && fail "Refusing to replace a symlinked worker in $install_dir"
 
@@ -169,4 +170,4 @@ mv -f -- "$staging/record" "$record"
 
 echo
 echo "Worker $manifest_version installed ($origin): $binary"
-echo "Reopen Bookmarks to use it."
+echo "If Bookmarks opened this setup, close the terminal to return to it."

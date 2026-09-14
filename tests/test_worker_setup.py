@@ -118,22 +118,33 @@ class ReleaseContractTests(unittest.TestCase):
     def test_pin_matches_plugin_version_and_format(self):
         manifest = json.loads((ROOT / "manifest.json").read_text())
         cargo = re.search(r'^version = "([^"]+)"$', (ROOT / "Cargo.toml").read_text(), re.M).group(1)
+        cargo_manifest = (ROOT / "Cargo.toml").read_text()
         values = pin_values()
         self.assertEqual(set(values), {"version", "source", "x86_64", "aarch64"})
         self.assertEqual(cargo, manifest["version"])
         self.assertEqual(values["version"], manifest["version"])
+        self.assertIn('rust-version = "1.96"', cargo_manifest)
+        self.assertIn("publish = false", cargo_manifest)
         hashes = [values["source"], values["x86_64"], values["aarch64"]]
         self.assertTrue(all(value == "" for value in hashes) or all(re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes))
 
     def test_workflow_actions_are_pinned_to_commits(self):
-        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
-        uses = re.findall(r"uses:\s*(\S+)", workflow)
-        self.assertTrue(uses)
-        for action in uses:
-            with self.subTest(action=action):
-                self.assertRegex(action, r"@[0-9a-f]{40}$")
-        self.assertIn("permissions: {}", workflow)
-        self.assertIn("if: github.event_name == 'push'", workflow)
+        workflows = [
+            path
+            for path in (ROOT / ".github" / "workflows").iterdir()
+            if path.suffix in {".yml", ".yaml"}
+        ]
+        self.assertTrue(workflows)
+        for workflow_path in workflows:
+            workflow = workflow_path.read_text()
+            uses = re.findall(r"uses:\s*(\S+)", workflow)
+            self.assertTrue(uses)
+            for action in uses:
+                with self.subTest(workflow=workflow_path.name, action=action):
+                    self.assertRegex(action, r"@[0-9a-f]{40}$")
+        release = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+        self.assertIn("permissions: {}", release)
+        self.assertIn("if: github.event_name == 'push'", release)
 
     def test_no_unverified_install_paths(self):
         checked = [ROOT / "README.md", ROOT / "worker-launcher.sh", *(ROOT / "scripts").glob("*.sh")]
@@ -143,6 +154,10 @@ class ReleaseContractTests(unittest.TestCase):
                 self.assertNotIn("releases/latest", text)
                 self.assertNotRegex(text, r"curl[^\n|]*\|\s*(ba)?sh")
                 self.assertNotRegex(text, r"curl[^\n|]*\|\s*tar")
+
+    def test_installer_repairs_private_directory_permissions(self):
+        installer = (ROOT / "scripts" / "install-worker.sh").read_text()
+        self.assertIn('chmod 700 -- "$directory"', installer)
 
     def test_launcher_only_runs_the_private_verified_worker(self):
         launcher = (ROOT / "worker-launcher.sh").read_text()
@@ -157,6 +172,7 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn('"omarchy-launch-tui", "--app-id=TUI.float"', ui)
         self.assertIn("root.workerInstaller, \"--pause\"", ui)
         self.assertIn("id: workerSetupPrompt", ui)
+        self.assertIn("close the terminal to return to it", (ROOT / "scripts" / "install-worker.sh").read_text())
 
 
 if __name__ == "__main__":

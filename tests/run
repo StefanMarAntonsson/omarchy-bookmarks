@@ -2,10 +2,14 @@
 
 set -eu
 
-project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_root"
 
 python3 -m unittest discover -s tests -p 'test_*.py'
+
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck worker-launcher.sh tests/run scripts/*.sh
+fi
 
 if command -v cargo >/dev/null 2>&1; then
   cargo fmt --all -- --check
