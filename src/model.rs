@@ -40,15 +40,26 @@ pub struct BookmarkInput {
 #[serde(rename_all = "camelCase")]
 pub struct UserSettings {
     pub default_search_scope: String,
+    #[serde(default)]
+    pub default_result_order: DefaultResultOrder,
     pub result_count: u8,
     pub open_in_new_window: bool,
     pub fetch_page_details: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum DefaultResultOrder {
+    #[default]
+    MostUsed,
+    RecentlyUsed,
 }
 
 impl Default for UserSettings {
     fn default() -> Self {
         Self {
             default_search_scope: "all".into(),
+            default_result_order: DefaultResultOrder::MostUsed,
             result_count: 5,
             open_in_new_window: false,
             fetch_page_details: false,

@@ -1,0 +1,13 @@
+# The worker release this plugin revision trusts. Written by
+# scripts/pin-worker-release.sh after a release is published and its GitHub
+# build attestations are verified; do not edit by hand.
+#
+# version  plugin and worker version the release was built for
+# source   scripts/worker-source-id.sh at the release tag
+# x86_64, aarch64  SHA-256 of each released executable
+#
+# Empty hashes mean no release is pinned yet; setup then builds from source.
+version=2.0.0
+source=
+x86_64=
+aarch64=

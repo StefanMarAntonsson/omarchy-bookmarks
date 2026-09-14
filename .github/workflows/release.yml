@@ -1,0 +1,153 @@
+# Builds the worker from a version tag and publishes it with GitHub build
+# attestations. A manual run builds and tests the same way but never publishes,
+# so the pipeline can be checked before tagging.
+#
+# After publication, run scripts/pin-worker-release.sh locally to verify the
+# attestations and commit the binary hashes into worker-release.pin.
+
+name: Release worker
+
+"on":
+  push:
+    tags:
+      - "v[0-9]*"
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  RUST_TOOLCHAIN: "1.96.0"
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: Build ${{ matrix.architecture }} worker
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - architecture: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out the exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate release identity
+        if: github.event_name == 'push'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          manifest=$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          test "$RELEASE_TAG" = "v$manifest"
+          test "$cargo_version" = "$manifest"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Install pinned toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes musl-tools
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "${{ matrix.target }}"
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Build static worker
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          target_env=$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')
+          export "CARGO_TARGET_${target_env}_LINKER=musl-gcc"
+          export "CC_$(printf '%s' "$TARGET" | tr '-' '_')=musl-gcc"
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          cargo build --locked --release --target "$TARGET"
+
+      - name: Verify and stage executable
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: omarchy-bookmarks-worker-${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/omarchy-bookmarks-worker"
+          manifest=$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')
+          test "$("$binary" --version)" = "omarchy-bookmarks-worker $manifest"
+          if readelf -l "$binary" | grep -q INTERP; then echo "Worker has a dynamic loader" >&2; exit 1; fi
+          if readelf -d "$binary" | grep -q NEEDED; then echo "Worker has dynamic dependencies" >&2; exit 1; fi
+          mkdir -p "$RUNNER_TEMP/release"
+          install -m 0755 "$binary" "$RUNNER_TEMP/release/$ASSET"
+          sha256sum "$RUNNER_TEMP/release/$ASSET"
+          echo "Worker source: $(scripts/worker-source-id.sh)"
+
+      - name: Attest executable
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ runner.temp }}/release/omarchy-bookmarks-worker-${{ matrix.architecture }}
+
+      - name: Upload executable
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: worker-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/release/omarchy-bookmarks-worker-${{ matrix.architecture }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish attested release
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download executables
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: worker-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/release
+
+      - name: Create checksums
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          sha256sum omarchy-bookmarks-worker-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest checksums
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ runner.temp }}/release/SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          gh release create "$RELEASE_TAG" \
+            omarchy-bookmarks-worker-x86_64 \
+            omarchy-bookmarks-worker-aarch64 \
+            SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "Bookmarks $RELEASE_TAG"

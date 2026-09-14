@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as Controls
 import QtQml.Models
 import Quickshell
+import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
@@ -15,10 +16,12 @@ Item {
   property string query: ""
   property string searchScope: "all"
   property string defaultSearchScope: "all"
+  property string defaultResultOrder: "mostUsed"
   property int resultCount: 5
   property bool openInNewWindow: false
   property bool fetchPageDetails: false
   property string draftSearchScope: "all"
+  property string draftDefaultResultOrder: "mostUsed"
   property int draftResultCount: 5
   property bool draftOpenInNewWindow: false
   property bool draftFetchPageDetails: false
@@ -49,6 +52,14 @@ Item {
   property bool altHeld: false
   property var browsers: []
   property int browsersRequestId: 0
+  // Library screens (import, restore, confirmations) share one request slot.
+  property string noticeMessage: ""
+  property bool libraryBusy: false
+  property int libraryRequestId: 0
+  property var libraryItems: []
+  property int libraryIndex: 0
+  property var importPreview: null
+  property var pendingLibraryAction: null
   property bool browsersLoading: false
   property string browsersError: ""
   readonly property var alternateBrowsers: root.browsers.filter(function(browser) { return !browser.isDefault }).slice(0, 9)
@@ -59,6 +70,7 @@ Item {
   readonly property int maximumResultCount: Math.min(10, Math.max(3, 2 + Math.floor((contentColumn.width + Style.spacing.sm) / (root.resultCountButtonWidth + Style.spacing.sm))))
   readonly property string pluginId: (manifest && manifest.id) || "stefanmara.bookmarks"
   readonly property string workerLauncher: localPath("worker-launcher.sh")
+  readonly property string workerInstaller: localPath("scripts/install-worker.sh")
 
   function isControlKey(event) {
     var nativeKey = Number(event.nativeVirtualKey)
@@ -90,6 +102,7 @@ Item {
     try { return decodeURIComponent(resolved) } catch (_) { return resolved }
   }
   function open(payloadJson) {
+    noticeMessage = ""
     query = ""; searchField.text = ""; results = []; defaultResults = []; selectedIndex = -1; latestSearchId = 0; searchLoading = false; searchHasMore = false; noResultsState = false; pendingSelectionIndex = -1
     previewingSelection = false; editingPreviewUrl = false; openUrlRequestId = 0; addUrlRequestId = 0; pendingAddUrl = ""
     mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false; browsersError = ""; opened = true
@@ -99,7 +112,14 @@ Item {
     requestBrowsers()
     Qt.callLater(function() { searchField.forceActiveFocus() })
   }
-  function close() { opened = false; query = ""; searchField.text = ""; results = []; defaultResults = []; selectedIndex = -1; pendingSelectionIndex = -1; noResultsState = false; previewingSelection = false; editingPreviewUrl = false; openUrlRequestId = 0; addUrlRequestId = 0; pendingAddUrl = ""; mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false }
+  function close() { opened = false; query = ""; searchField.text = ""; results = []; defaultResults = []; selectedIndex = -1; pendingSelectionIndex = -1; noResultsState = false; previewingSelection = false; editingPreviewUrl = false; openUrlRequestId = 0; addUrlRequestId = 0; pendingAddUrl = ""; mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false; noticeMessage = ""; importPreview = null; pendingLibraryAction = null; if (!libraryBusy) libraryItems = [] }
+  // Setup runs in a visible terminal so its verification result can be read;
+  // reopening the overlay starts the newly installed worker.
+  function startWorkerSetup() {
+    if (!worker.setupRequired || workerSetup.running) return
+    workerSetup.running = true
+    dismiss()
+  }
   function dismiss() { close(); if (shell && typeof shell.hide === "function") shell.hide(pluginId) }
   function performSearch() {
     if (!query.trim()) { noResultsState = false; results = defaultResults }
@@ -118,12 +138,14 @@ Item {
   function applySettings(settings) {
     if (!settings) return
     defaultSearchScope = settings.defaultSearchScope === "tags" ? "tags" : "all"
+    defaultResultOrder = settings.defaultResultOrder === "recentlyUsed" ? "recentlyUsed" : "mostUsed"
     resultCount = Math.max(3, Math.min(10, Number(settings.resultCount || 5)))
     openInNewWindow = settings.openInNewWindow === true
     fetchPageDetails = settings.fetchPageDetails === true
   }
   function beginSettings() {
     draftSearchScope = defaultSearchScope
+    draftDefaultResultOrder = defaultResultOrder
     draftResultCount = resultCount
     draftOpenInNewWindow = openInNewWindow
     draftFetchPageDetails = fetchPageDetails
@@ -137,6 +159,7 @@ Item {
       type: "save_settings",
       settings: {
         defaultSearchScope: draftSearchScope,
+        defaultResultOrder: draftDefaultResultOrder,
         resultCount: draftResultCount,
         openInNewWindow: draftOpenInNewWindow,
         fetchPageDetails: draftFetchPageDetails
@@ -217,6 +240,10 @@ Item {
   function activateCurrent(invertOpeningPreference) {
     if (editingPreviewUrl) { requestOpenUrl(searchField.text, invertOpeningPreference, null); return }
     var item = selectedResult()
+    if (!item && query.trim() && !searchLoading && results.length) {
+      selectedIndex = 0
+      item = selectedResult()
+    }
     if (item) {
       if (item.action === "open_url") requestOpenUrl(item.url, invertOpeningPreference, null)
       else activateSelected(invertOpeningPreference)
@@ -240,6 +267,23 @@ Item {
     if (item.action === "open_url") { requestOpenUrl(item.url, false, browserId); return }
     if (item.action) return
     worker.request({type: "open", bookmark_id: item.id, new_window: false, browser_id: String(browserId)}); dismiss()
+  }
+  function requestOpenUrlInAllBrowsers(url) {
+    if (openUrlRequestId) return
+    statusMessage = ""
+    openUrlRequestId = worker.request({type: "open_url_all", url: String(url || "").trim()})
+    if (!openUrlRequestId) statusMessage = worker.error || "Worker is unavailable"
+  }
+  function activateCurrentInAllBrowsers() {
+    if (editingPreviewUrl) { requestOpenUrlInAllBrowsers(searchField.text); return }
+    var item = selectedResult()
+    if (!item) {
+      if (looksLikeWebUrl(searchField.text)) requestOpenUrlInAllBrowsers(searchField.text)
+      return
+    }
+    if (item.action === "open_url") { requestOpenUrlInAllBrowsers(item.url); return }
+    if (item.action) return
+    worker.request({type: "open_all", bookmark_id: item.id}); dismiss()
   }
   function requestAddCurrentUrl() {
     if (addUrlRequestId) return
@@ -270,11 +314,130 @@ Item {
       description: descriptionField.text, tags: tags, keyword: editingBookmark ? (editingBookmark.keyword || "") : ""}
     if (!worker.request({type: editingBookmark ? "edit" : "add", bookmark: bookmark})) statusMessage = worker.error || "Worker is unavailable"
   }
+  function returnToSettings() {
+    mode = "settings"; importPreview = null; pendingLibraryAction = null
+    Qt.callLater(function() { settingsKeyCatcher.forceActiveFocus() })
+  }
+  function focusLibrary() { Qt.callLater(function() { libraryKeyCatcher.forceActiveFocus() }) }
+  function libraryRequest(body) {
+    if (libraryBusy) return
+    statusMessage = ""; noticeMessage = ""
+    libraryRequestId = worker.request(body)
+    libraryBusy = libraryRequestId !== 0
+    if (!libraryRequestId) statusMessage = worker.error || "Worker is unavailable"
+  }
+  function beginImport() {
+    if (libraryBusy) return
+    mode = "import"; libraryItems = []; libraryIndex = 0; importPreview = null
+    libraryRequest({type: "import_sources"}); focusLibrary()
+  }
+  function beginRestore() {
+    if (libraryBusy) return
+    mode = "restore"; libraryItems = []; libraryIndex = 0
+    libraryRequest({type: "backups_list"}); focusLibrary()
+  }
+  function beginLibraryConfirm(action) {
+    if (libraryBusy) return
+    statusMessage = ""; noticeMessage = ""
+    pendingLibraryAction = action; mode = "confirmLibrary"; focusLibrary()
+  }
+  function confirmLoadExamples() {
+    beginLibraryConfirm({title: "Replace your bookmarks with example bookmarks?", detail: "Your current library is backed up first and can be brought back with Restore backup.", confirmLabel: "Load examples", request: {type: "library_load_examples"}})
+  }
+  function confirmClearLibrary() {
+    beginLibraryConfirm({title: "Delete all bookmarks?", detail: "Your current library is backed up first and can be brought back with Restore backup.", confirmLabel: "Clear all", request: {type: "library_clear"}})
+  }
+  function moveLibrarySelection(delta) {
+    if (!libraryItems.length) return
+    libraryIndex = Math.max(0, Math.min(libraryIndex + delta, libraryItems.length - 1))
+    libraryList.positionViewAtIndex(libraryIndex, ListView.Contain)
+  }
+  function activateLibrary() {
+    if (libraryBusy) return
+    if (mode === "import") {
+      if (importPreview) {
+        if (importPreview.counts.new > 0) libraryRequest({type: "import_bookmarks", source_id: importPreview.sourceId})
+        else returnToSettings()
+        return
+      }
+      var source = libraryItems[libraryIndex]
+      if (source) libraryRequest({type: "import_preview", source_id: source.id})
+    } else if (mode === "restore") {
+      var backup = libraryItems[libraryIndex]
+      if (!backup) return
+      beginLibraryConfirm({title: "Restore the backup from " + formatBackupTime(backup.createdAt) + "?", detail: bookmarkCount(backup.bookmarks) + ". Your current library is backed up first. Settings are kept.", confirmLabel: "Restore", request: {type: "backup_restore", name: backup.name}, returnMode: "restore"})
+    } else if (mode === "confirmLibrary" && pendingLibraryAction) {
+      libraryRequest(pendingLibraryAction.request)
+    }
+  }
+  function libraryBack() {
+    if (libraryBusy) return
+    statusMessage = ""
+    if (mode === "import" && importPreview) { importPreview = null; return }
+    if (mode === "confirmLibrary" && pendingLibraryAction && pendingLibraryAction.returnMode === "restore") { pendingLibraryAction = null; mode = "restore"; return }
+    returnToSettings()
+  }
+  function finishLibrary(message) {
+    noticeMessage = message
+    importPreview = null; pendingLibraryAction = null; libraryItems = []
+    mode = "search"
+    restoreSearchQuery()
+    performSearch()
+    Qt.callLater(function() { searchField.forceActiveFocus() })
+  }
+  function bookmarkCount(count) { return Number(count) === 1 ? "1 bookmark" : Number(count) + " bookmarks" }
+  function backupNote(name) { return name ? " Your previous library was backed up." : "" }
+  function formatBackupTime(millis) { return Qt.formatDateTime(new Date(Number(millis)), "yyyy-MM-dd hh:mm") }
+  function backupReasonLabel(reason) {
+    return ({"manual": "Manual backup", "before-import": "Before import", "before-restore": "Before restore", "before-clear": "Before clearing", "before-examples": "Before loading examples"})[reason] || "Backup"
+  }
+  function handleLibraryResult(result) {
+    if (Array.isArray(result.importSources)) { libraryItems = result.importSources; libraryIndex = 0; return }
+    if (result.importPreview) { importPreview = result.importPreview; return }
+    if (Array.isArray(result.backups)) { libraryItems = result.backups; libraryIndex = 0; return }
+    if (result.backupCreated) { noticeMessage = "Backup saved with " + bookmarkCount(result.backupCreated.bookmarks) + "."; return }
+    if (result.imported) {
+      var imported = result.imported
+      finishLibrary(imported.added ? "Imported " + bookmarkCount(imported.added) + "." + backupNote(imported.backup) : "Nothing new to import.")
+      return
+    }
+    if (result.restored) { finishLibrary("Restored " + bookmarkCount(result.restored.bookmarks) + "." + backupNote(result.restored.backup)); return }
+    if (result.cleared) { finishLibrary("Removed " + bookmarkCount(result.cleared.removed) + "." + backupNote(result.cleared.backup)); return }
+    if (result.examplesLoaded) { finishLibrary("Loaded " + bookmarkCount(result.examplesLoaded.added) + " of examples." + backupNote(result.examplesLoaded.backup)); return }
+  }
+  function libraryTitle() {
+    if (mode === "confirmLibrary") return pendingLibraryAction ? pendingLibraryAction.title : ""
+    if (mode === "import") {
+      if (importPreview) return "Import from " + importPreview.browser + " (" + importPreview.profile + ")?"
+      if (libraryItems.length) return "Import bookmarks from a browser"
+      return libraryBusy ? "Finding browsers…" : "No browser bookmarks found"
+    }
+    if (libraryItems.length) return "Restore a backup"
+    return libraryBusy ? "Loading backups…" : "No backups yet"
+  }
+  function libraryDetail() {
+    if (mode === "confirmLibrary") return pendingLibraryAction ? pendingLibraryAction.detail : ""
+    if (mode === "import") {
+      if (importPreview) {
+        var counts = importPreview.counts
+        if (!counts.new) return "Everything in this profile is already saved."
+        return bookmarkCount(counts.new) + " will be added. " + counts.alreadySaved + " already saved, " + counts.skipped + " skipped (not web pages or repeated). Your library is backed up first."
+      }
+      return "Bookmarks are read from Firefox, Zen, LibreWolf, Chrome, Chromium, Brave, Vivaldi, Edge, and similar browsers. Existing bookmarks are not changed."
+    }
+    return libraryItems.length ? "Your current library is backed up before restoring. Settings are kept." : "Back up now from Settings, or make a change that backs up automatically."
+  }
+  function libraryPrimaryLabel() {
+    if (mode === "confirmLibrary") return pendingLibraryAction ? pendingLibraryAction.confirmLabel : ""
+    if (mode === "import") return importPreview ? (importPreview.counts.new ? "Import" : "Done") : "Preview"
+    return "Restore…"
+  }
   function cancelSecondary() { mode = "search"; editingBookmark = null; statusMessage = ""; Qt.callLater(function() { searchField.forceActiveFocus() }) }
   function requestDelete() { var item = selectedResult(); if (item && !item.action) { editingBookmark = item; mode = "delete"; Qt.callLater(function(){ deleteKeyCatcher.forceActiveFocus() }) } }
   function domain(url) { var match = String(url || "").match(/^https?:\/\/([^/]+)(\/.*)?$/i); return match ? match[1] + ((match[2] && match[2] !== "/") ? match[2] : "") : String(url || "") }
   function handleMessage(response) {
     if (!response.ok) {
+      if (libraryRequestId && response.id === libraryRequestId) { libraryRequestId = 0; libraryBusy = false; statusMessage = String(response.error || "Library operation failed"); return }
       if (openUrlRequestId && response.id === openUrlRequestId) { openUrlRequestId = 0; statusMessage = String(response.error || "Could not open URL"); return }
       if (addUrlRequestId && response.id === addUrlRequestId) { addUrlRequestId = 0; pendingAddUrl = ""; statusMessage = String(response.error || "Enter a valid HTTP or HTTPS URL"); return }
       if (response.id === settingsRequestId || response.id === settingsSaveRequestId) { statusMessage = String(response.error || "Could not load settings"); return }
@@ -283,6 +446,7 @@ Item {
       statusMessage = String(response.error || "Bookmark operation failed"); return
     }
     var result = response.result || {}
+    if (libraryRequestId && response.id === libraryRequestId) { libraryRequestId = 0; libraryBusy = false; handleLibraryResult(result); return }
     if (openUrlRequestId && response.id === openUrlRequestId) { openUrlRequestId = 0; dismiss(); return }
     if (addUrlRequestId && response.id === addUrlRequestId) {
       var urlToAdd = pendingAddUrl
@@ -294,16 +458,18 @@ Item {
     if (response.id === settingsRequestId) {
       var previousScope = searchScope
       var previousCount = resultCount
+      var previousOrder = defaultResultOrder
       applySettings(result.settings)
       if (mode === "settings") {
         draftSearchScope = defaultSearchScope
+        draftDefaultResultOrder = defaultResultOrder
         draftResultCount = resultCount
         draftOpenInNewWindow = openInNewWindow
         draftFetchPageDetails = fetchPageDetails
       }
       if (mode === "search") {
         searchScope = defaultSearchScope
-        if (previousScope !== searchScope || previousCount !== resultCount) performSearch()
+        if (previousScope !== searchScope || previousCount !== resultCount || previousOrder !== defaultResultOrder) performSearch()
       }
       return
     }
@@ -378,11 +544,13 @@ Item {
           width: (bookmarkActions.width - bookmarkActions.spacing * 2) / 3
           spacing: Style.spacing.xs
           Text {
+            textFormat: Text.PlainText
             width: parent.width; text: modelData.key; color: Color.menu.selectedText
             font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium
             elide: Text.ElideRight
           }
           Text {
+            textFormat: Text.PlainText
             width: parent.width; text: modelData.label; color: Color.menu.selectedText; opacity: 0.72
             font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
             elide: Text.ElideRight
@@ -393,18 +561,36 @@ Item {
 
     Row {
       id: browserActions
-      visible: controller.altHeld && controller.alternateBrowsers.length > 0
+      visible: controller.altHeld && controller.browsers.length > 0
       anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
       spacing: Style.spacing.md
+
+      Column {
+        width: (browserActions.width - browserActions.spacing * controller.alternateBrowsers.length) / (controller.alternateBrowsers.length + 1)
+        spacing: Style.spacing.xs
+        Text {
+          textFormat: Text.PlainText
+          width: parent.width; text: "Ctrl+Alt+A"; color: Color.menu.selectedText
+          font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium
+          elide: Text.ElideRight
+        }
+        Text {
+          width: parent.width; text: "All browsers"; textFormat: Text.PlainText
+          color: Color.menu.selectedText; opacity: 0.72
+          font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
 
       Repeater {
         model: controller.alternateBrowsers
         delegate: Column {
           required property int index
           required property var modelData
-          width: (browserActions.width - browserActions.spacing * (controller.alternateBrowsers.length - 1)) / controller.alternateBrowsers.length
+          width: (browserActions.width - browserActions.spacing * controller.alternateBrowsers.length) / (controller.alternateBrowsers.length + 1)
           spacing: Style.spacing.xs
           Text {
+            textFormat: Text.PlainText
             width: parent.width; text: "Ctrl+Alt+" + (index + 1); color: Color.menu.selectedText
             font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium
             elide: Text.ElideRight
@@ -420,9 +606,10 @@ Item {
     }
 
     Text {
-      visible: controller.altHeld && controller.alternateBrowsers.length === 0
+      textFormat: Text.PlainText
+      visible: controller.altHeld && controller.browsers.length === 0
       anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
-      text: controller.browsersLoading ? "Finding alternate browsers…" : controller.browsersError ? controller.browsersError : "No alternate browsers configured"
+      text: controller.browsersLoading ? "Finding browsers…" : controller.browsersError ? controller.browsersError : "No browsers configured"
       color: controller.browsersError ? Color.urgent : Color.menu.selectedText
       opacity: controller.browsersError ? 1 : 0.72
       font.family: Style.font.menuFamily; font.pixelSize: Style.font.bodySmall
@@ -534,6 +721,10 @@ Item {
     onMessage: function(response) { root.handleMessage(response) }
   }
   Timer { id: searchDebounce; interval: 35; repeat: false; onTriggered: root.performSearch() }
+  Process {
+    id: workerSetup
+    command: ["omarchy-launch-tui", "--app-id=TUI.float", root.workerInstaller, "--pause"]
+  }
 
   PanelWindow {
     id: panel
@@ -576,6 +767,13 @@ Item {
       }
 
       Shortcut {
+        sequence: "Ctrl+Alt+A"
+        enabled: root.opened && root.mode === "search" && root.browsers.length > 0
+        autoRepeat: false
+        onActivated: root.activateCurrentInAllBrowsers()
+      }
+
+      Shortcut {
         sequence: "Ctrl+S"
         enabled: root.opened && root.mode === "search"
         autoRepeat: false
@@ -611,6 +809,7 @@ Item {
             }
           }
           Text {
+            textFormat: Text.PlainText
             visible: root.controlHeld && !root.altHeld && searchField.text.length === 0
             anchors.centerIn: parent
             text: "Ctrl+N   Add bookmark     Ctrl+S   Settings"
@@ -627,6 +826,7 @@ Item {
             color: Color.menu.background; z: 2
             Text {
               id: escapeHint
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               text: "esc"
               color: Color.menu.text; opacity: 0.62
@@ -638,6 +838,7 @@ Item {
               root.previewingSelection = false; root.editingPreviewUrl = true; root.selectedIndex = -1; root.pendingSelectionIndex = -1; root.statusMessage = ""
               return
             }
+            root.noticeMessage = ""
             root.query = text; root.selectedIndex = -1; root.pendingSelectionIndex = -1; root.statusMessage = ""
             root.searchHasMore = false; root.searchLoading = true
             if (!root.query.trim()) { root.results = root.defaultResults; root.noResultsState = false }
@@ -653,6 +854,7 @@ Item {
             else if (!root.query.trim() && event.key === Qt.Key_Down) { root.moveTopSelection(1); event.accepted = true }
             else if (root.query.trim() && event.key === Qt.Key_Up) { root.moveSelection(-1); event.accepted = true }
             else if (root.query.trim() && event.key === Qt.Key_Down) { root.moveSelection(1); event.accepted = true }
+            else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && worker.setupRequired) { root.startWorkerSetup(); event.accepted = true }
             else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.activateCurrent(false); event.accepted = true }
             else if (event.modifiers === Qt.ControlModifier && directSlot >= 0 && directSlot < root.resultCount) { root.activateIndex(root.shortcutIndex(directSlot)); event.accepted = true }
             else if (event.key === Qt.Key_N && event.modifiers === Qt.ControlModifier) { root.requestAddCurrentUrl(); event.accepted = true }
@@ -666,7 +868,7 @@ Item {
         }
         Column {
           id: topBookmarks
-          visible: root.mode === "search" && root.query.trim().length === 0
+          visible: root.mode === "search" && root.query.trim().length === 0 && !worker.setupRequired
           width: parent.width; height: root.resultWindowHeight; spacing: Style.spacing.xs
           Repeater {
             model: root.results
@@ -676,7 +878,7 @@ Item {
               width: topBookmarks.width; height: Style.space(58); radius: root.contentCornerRadius
               color: index === root.selectedIndex ? Color.menu.selectedBackground : "transparent"
               MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: root.selectedIndex = index; onClicked: root.activateIndex(index) }
-              Text { id: topShortcutHint; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld; text: "Ctrl+" + root.resultShortcutKey(index); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+              Text { id: topShortcutHint; textFormat: Text.PlainText; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld; text: "Ctrl+" + root.resultShortcutKey(index); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
               Column {
                 visible: !parent.showingShortcuts
                 anchors.left: parent.left; anchors.right: topShortcutHint.visible ? topShortcutHint.left : parent.right; anchors.verticalCenter: parent.verticalCenter
@@ -702,7 +904,7 @@ Item {
         }
         ListView {
           id: searchResults
-          visible: root.mode === "search" && root.query.trim().length > 0; width: parent.width; spacing: Style.spacing.xs
+          visible: root.mode === "search" && root.query.trim().length > 0 && !worker.setupRequired; width: parent.width; spacing: Style.spacing.xs
           height: root.noResultsState ? Style.space(44) : root.resultWindowHeight
           clip: true; model: root.results; boundsBehavior: Flickable.StopAtBounds; snapMode: ListView.SnapToItem
           Controls.ScrollBar.vertical: Controls.ScrollBar {}
@@ -719,7 +921,7 @@ Item {
               width: contentColumn.width; height: Style.space(58); radius: root.contentCornerRadius
               color: index === root.selectedIndex ? Color.menu.selectedBackground : "transparent"
               MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: if (!root.editingPreviewUrl) root.previewSelection(index); onClicked: root.activateIndex(index) }
-              Text { id: shortcutHint; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld && index >= searchResults.visibleStartIndex && index < searchResults.visibleStartIndex + root.resultCount; text: "Ctrl+" + root.resultShortcutKey(index - searchResults.visibleStartIndex); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+              Text { id: shortcutHint; textFormat: Text.PlainText; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld && index >= searchResults.visibleStartIndex && index < searchResults.visibleStartIndex + root.resultCount; text: "Ctrl+" + root.resultShortcutKey(index - searchResults.visibleStartIndex); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
               Column {
                 visible: !parent.showingShortcuts
                 anchors.left: parent.left; anchors.right: shortcutHint.visible ? shortcutHint.left : parent.right; anchors.verticalCenter: parent.verticalCenter
@@ -748,7 +950,28 @@ Item {
                 controller: root
               }
           }
-          Text { visible: root.noResultsState && !worker.error; width: parent.width; height: Style.space(44); text: "No matching bookmarks"; color: Color.menu.text; opacity: 0.55; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; font.family: Style.font.menuFamily }
+          Text { textFormat: Text.PlainText; visible: root.noResultsState && !worker.error; width: parent.width; height: Style.space(44); text: "No matching bookmarks"; color: Color.menu.text; opacity: 0.55; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; font.family: Style.font.menuFamily }
+        }
+        Column {
+          id: workerSetupPrompt
+          visible: root.mode === "search" && worker.setupRequired
+          width: parent.width; spacing: Style.spacing.sm
+          topPadding: Style.spacing.sm; bottomPadding: Style.spacing.sm
+          Text {
+            width: parent.width; textFormat: Text.PlainText; wrapMode: Text.Wrap
+            text: worker.error || "The bookmark worker needs to be set up."
+            color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading
+          }
+          Text {
+            width: parent.width; textFormat: Text.PlainText; wrapMode: Text.Wrap
+            text: "Setup opens a terminal. It installs the worker release pinned by this plugin after checking its SHA-256, or builds the plugin's own source with cargo when no release matches."
+            color: Color.menu.text; opacity: 0.6; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+          }
+          Item {
+            width: parent.width; height: Style.space(38)
+            Text { textFormat: Text.PlainText; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; text: "Enter to set up · Escape to close"; color: Color.menu.text; opacity: 0.45; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Button { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; width: Style.space(120); height: Style.space(34); text: "Set up worker"; bordered: true; selected: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.startWorkerSetup() }
+          }
         }
         Column {
           visible: root.mode === "form"; width: parent.width; spacing: Style.spacing.sm
@@ -773,10 +996,10 @@ Item {
             }
           }
           Controls.TextField { id: tagsField; width: parent.width; placeholderText: "Tags, comma separated"; selectByMouse: true; font.family: Style.font.menuFamily; onAccepted: root.saveForm(); Keys.onPressed: function(e){if(e.key===Qt.Key_Escape){root.cancelSecondary();e.accepted=true}} }
-          Row { visible: root.suggestedTags.length > 0; spacing: Style.spacing.xs; Repeater { model: root.suggestedTags; delegate: Controls.Button { required property string modelData; text: "+ " + modelData; onClicked: { var values=tagsField.text.split(",").map(function(v){return v.trim()}).filter(Boolean); if(values.indexOf(modelData)<0) values.push(modelData); tagsField.text=values.join(", ") } } } }
+          Row { visible: root.suggestedTags.length > 0; spacing: Style.spacing.xs; Repeater { model: root.suggestedTags; delegate: Button { required property string modelData; height: Style.space(30); text: "+ " + modelData; bordered: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: { var values=tagsField.text.split(",").map(function(v){return v.trim()}).filter(Boolean); if(values.indexOf(modelData)<0) values.push(modelData); tagsField.text=values.join(", ") } } } }
           Item {
             width: parent.width; height: Style.space(38)
-            Text { anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; text: "Enter to save"; color: Color.menu.text; opacity: 0.45; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Text { textFormat: Text.PlainText; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; text: "Enter to save"; color: Color.menu.text; opacity: 0.45; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
             Row {
               anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: Style.spacing.sm
               Button { width: Style.space(88); height: Style.space(34); text: "Cancel"; bordered: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.cancelSecondary() }
@@ -792,13 +1015,14 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width; text: "Settings"; color: Color.menu.text
             font.family: Style.font.menuFamily; font.pixelSize: Style.font.title; font.weight: Font.DemiBold
           }
 
           Column {
             width: parent.width; spacing: Style.spacing.xs
-            Text { text: "Default search"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Text { textFormat: Text.PlainText; text: "Default search"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
             Row {
               spacing: Style.spacing.sm
               Button { id: settingsKeyCatcher; width: Style.space(150); height: Style.space(34); text: "Bookmarks & tags"; bordered: true; selected: root.draftSearchScope === "all"; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftSearchScope = "all" }
@@ -808,7 +1032,7 @@ Item {
 
           Column {
             width: parent.width; spacing: Style.spacing.xs
-            Text { text: "Visible results"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Text { textFormat: Text.PlainText; text: "Visible results"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
             Row {
               width: parent.width
               spacing: Style.spacing.sm
@@ -828,7 +1052,17 @@ Item {
 
           Column {
             width: parent.width; spacing: Style.spacing.xs
-            Text { text: "Open bookmarks"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Text { textFormat: Text.PlainText; text: "Empty search shows"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Row {
+              spacing: Style.spacing.sm
+              Button { width: Style.space(150); height: Style.space(34); text: "Most used"; bordered: true; selected: root.draftDefaultResultOrder === "mostUsed"; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftDefaultResultOrder = "mostUsed" }
+              Button { width: Style.space(150); height: Style.space(34); text: "Recently used"; bordered: true; selected: root.draftDefaultResultOrder === "recentlyUsed"; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftDefaultResultOrder = "recentlyUsed" }
+            }
+          }
+
+          Column {
+            width: parent.width; spacing: Style.spacing.xs
+            Text { textFormat: Text.PlainText; text: "Open bookmarks"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
             Row {
               spacing: Style.spacing.sm
               Button { width: Style.space(150); height: Style.space(34); text: "In a new tab"; bordered: true; selected: !root.draftOpenInNewWindow; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftOpenInNewWindow = false }
@@ -838,18 +1072,32 @@ Item {
 
           Column {
             width: parent.width; spacing: Style.spacing.xs
-            Text { text: "Details for pasted URLs"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Text { textFormat: Text.PlainText; text: "Details for pasted URLs"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
             Row {
               spacing: Style.spacing.sm
               Button { width: Style.space(150); height: Style.space(34); text: "Fetch automatically"; bordered: true; selected: root.draftFetchPageDetails; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftFetchPageDetails = true }
               Button { width: Style.space(150); height: Style.space(34); text: "Never fetch"; bordered: true; selected: !root.draftFetchPageDetails; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.draftFetchPageDetails = false }
             }
-            Text { width: parent.width; text: "Fetching contacts the website and reveals your IP address and requested URL."; color: Color.menu.text; opacity: 0.45; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Text { textFormat: Text.PlainText; width: parent.width; text: "Fetching contacts the website and reveals your IP address and requested URL."; color: Color.menu.text; opacity: 0.45; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+          }
+
+          Column {
+            width: parent.width; spacing: Style.spacing.xs
+            Text { textFormat: Text.PlainText; text: "Library"; color: Color.menu.text; opacity: 0.72; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Flow {
+              width: parent.width; spacing: Style.spacing.sm
+              Button { width: Style.space(170); height: Style.space(34); text: "Import from browser"; bordered: true; focusable: true; enabled: !root.libraryBusy; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.beginImport() }
+              Button { width: Style.space(130); height: Style.space(34); text: root.libraryBusy ? "Working…" : "Back up now"; bordered: true; focusable: true; enabled: !root.libraryBusy; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.libraryRequest({type: "backup_create"}) }
+              Button { width: Style.space(140); height: Style.space(34); text: "Restore backup"; bordered: true; focusable: true; enabled: !root.libraryBusy; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.beginRestore() }
+              Button { width: Style.space(140); height: Style.space(34); text: "Load examples"; bordered: true; focusable: true; enabled: !root.libraryBusy; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.confirmLoadExamples() }
+              Button { width: Style.space(110); height: Style.space(34); text: "Clear all"; bordered: true; focusable: true; enabled: !root.libraryBusy; foreground: Color.urgent; accent: Color.urgent; onClicked: root.confirmClearLibrary() }
+            }
+            Text { textFormat: Text.PlainText; width: parent.width; text: "Import, restore, clear, and examples back up your library first. Settings changes above still need Save."; color: Color.menu.text; opacity: 0.45; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
           }
 
           Item {
             width: parent.width; height: Style.space(38)
-            Text { anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; text: "Ctrl+Enter to save · Escape to cancel"; color: Color.menu.text; opacity: 0.45; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Text { textFormat: Text.PlainText; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; text: "Ctrl+Enter to save · Escape to cancel"; color: Color.menu.text; opacity: 0.45; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
             Row {
               anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: Style.spacing.sm
               Button { width: Style.space(88); height: Style.space(34); text: "Cancel"; bordered: true; focusable: true; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.cancelSecondary() }
@@ -858,12 +1106,78 @@ Item {
           }
         }
         Column {
-          visible: root.mode === "delete"; width: parent.width; spacing: Style.spacing.md
-          Text { width: parent.width; text: "Delete “" + (root.editingBookmark ? (root.editingBookmark.title || root.domain(root.editingBookmark.originalUrl)) : "") + "”?"; color: Color.menu.text; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading }
-          Text { width: parent.width; text: "Enter confirms · Escape cancels"; color: Color.menu.text; opacity: 0.5; font.family: Style.font.menuFamily }
-          Item { id: deleteKeyCatcher; width: 1; height: 1; Keys.onPressed: function(e){if(e.key===Qt.Key_Escape){root.cancelSecondary();e.accepted=true}else if(e.key===Qt.Key_Return||e.key===Qt.Key_Enter){worker.request({type:"delete",bookmark_id:root.editingBookmark.id});e.accepted=true}} }
+          id: libraryPanel
+          visible: root.mode === "import" || root.mode === "restore" || root.mode === "confirmLibrary"
+          width: parent.width; spacing: Style.spacing.sm
+          Keys.onPressed: function(event) {
+            if (event.key === Qt.Key_Escape) { root.libraryBack(); event.accepted = true }
+            else if (event.key === Qt.Key_Up) { root.moveLibrarySelection(-1); event.accepted = true }
+            else if (event.key === Qt.Key_Down) { root.moveLibrarySelection(1); event.accepted = true }
+            else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.activateLibrary(); event.accepted = true }
+          }
+          Text {
+            width: parent.width; textFormat: Text.PlainText; wrapMode: Text.Wrap
+            text: root.libraryTitle()
+            color: Color.menu.text; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading
+          }
+          Text {
+            width: parent.width; textFormat: Text.PlainText; wrapMode: Text.Wrap
+            text: root.libraryDetail()
+            color: Color.menu.text; opacity: 0.6; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+          }
+          ListView {
+            id: libraryList
+            readonly property real rowHeight: Style.space(52)
+            visible: (root.mode === "import" && !root.importPreview) || root.mode === "restore"
+            width: parent.width; spacing: Style.spacing.xs; clip: true
+            height: Math.min(count, 6) * (rowHeight + spacing)
+            model: root.libraryItems; boundsBehavior: Flickable.StopAtBounds
+            Controls.ScrollBar.vertical: Controls.ScrollBar {}
+            delegate: Rectangle {
+              required property int index; required property var modelData
+              width: libraryList.width; height: libraryList.rowHeight; radius: root.contentCornerRadius
+              color: index === root.libraryIndex ? Color.menu.selectedBackground : "transparent"
+              MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: root.libraryIndex = index; onClicked: { root.libraryIndex = index; root.activateLibrary() } }
+              Column {
+                anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md; spacing: Style.spacing.xs
+                Text {
+                  width: parent.width; textFormat: Text.PlainText; elide: Text.ElideRight
+                  text: root.mode === "import" ? modelData.browser : root.formatBackupTime(modelData.createdAt) + "  ·  " + root.backupReasonLabel(modelData.reason)
+                  color: index === root.libraryIndex ? Color.menu.selectedText : Color.menu.text
+                  font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium
+                }
+                Text {
+                  width: parent.width; textFormat: Text.PlainText; elide: Text.ElideRight
+                  text: root.mode === "import" ? modelData.profile : root.bookmarkCount(modelData.bookmarks)
+                  color: Color.menu.text; opacity: 0.52; font.family: Style.font.menuFamily; font.pixelSize: Style.font.bodySmall
+                }
+              }
+            }
+          }
+          Item {
+            width: parent.width; height: Style.space(38)
+            Text { textFormat: Text.PlainText; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; text: root.libraryBusy ? "Working…" : "Enter to continue · Escape to go back"; color: Color.menu.text; opacity: 0.45; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+            Row {
+              anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: Style.spacing.sm
+              Button { width: Style.space(88); height: Style.space(34); text: "Back"; bordered: true; focusable: true; enabled: !root.libraryBusy; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.libraryBack() }
+              Button {
+                visible: root.mode === "confirmLibrary" || Boolean(root.importPreview) || root.libraryItems.length > 0
+                width: Style.space(120); height: Style.space(34); text: root.libraryPrimaryLabel(); bordered: true; selected: true; focusable: true
+                enabled: !root.libraryBusy; foreground: Color.menu.text; accent: Color.menu.selectedText; onClicked: root.activateLibrary()
+              }
+            }
+          }
+          Item { id: libraryKeyCatcher; width: 1; height: 1 }
         }
-        Text { visible: Boolean(root.statusMessage || worker.error); width: parent.width; text: root.statusMessage || worker.error; color: Color.urgent; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+        Column {
+          visible: root.mode === "delete"; width: parent.width; spacing: Style.spacing.md
+          Text { textFormat: Text.PlainText; width: parent.width; text: "Delete “" + (root.editingBookmark ? (root.editingBookmark.title || root.domain(root.editingBookmark.originalUrl)) : "") + "”?"; color: Color.menu.text; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading }
+          Text { textFormat: Text.PlainText; width: parent.width; text: "Enter confirms · Escape cancels"; color: Color.menu.text; opacity: 0.5; font.family: Style.font.menuFamily }
+          Item { id: deleteKeyCatcher; width: 1; height: 1; Keys.onPressed: function(e){if(e.key===Qt.Key_Escape){root.cancelSecondary();e.accepted=true}else if((e.key===Qt.Key_Return||e.key===Qt.Key_Enter)&&root.editingBookmark){worker.request({type:"delete",bookmark_id:root.editingBookmark.id});e.accepted=true}} }
+        }
+        Text { textFormat: Text.PlainText; visible: Boolean(root.noticeMessage) && !root.statusMessage; width: parent.width; text: root.noticeMessage; color: Color.menu.text; opacity: 0.72; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+        Text { textFormat: Text.PlainText; visible: Boolean(root.statusMessage || (worker.error && !worker.setupRequired)); width: parent.width; text: root.statusMessage || worker.error; color: Color.urgent; wrapMode: Text.Wrap; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
       }
 
     }

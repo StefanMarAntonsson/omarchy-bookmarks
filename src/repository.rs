@@ -1,12 +1,14 @@
 use std::{
     collections::HashSet,
     fs,
+    io::{Read, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::Deserialize;
 use thiserror::Error;
 use uuid::Uuid;
@@ -16,13 +18,16 @@ use crate::{
     url_key::normalize_url,
 };
 
-const MAX_STORE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_BOOKMARKS: usize = 50_000;
-const MAX_TITLE: usize = 2_048;
-const MAX_DESCRIPTION: usize = 8_192;
-const MAX_TAGS: usize = 64;
-const MAX_TAG: usize = 128;
-const MAX_KEYWORD: usize = 128;
+pub(crate) const MAX_STORE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_BOOKMARKS: usize = 50_000;
+pub(crate) const MAX_TITLE: usize = 2_048;
+pub(crate) const MAX_DESCRIPTION: usize = 8_192;
+pub(crate) const MAX_TAGS: usize = 64;
+pub(crate) const MAX_TAG: usize = 128;
+pub(crate) const MAX_KEYWORD: usize = 128;
+pub(crate) const MAX_ID: usize = 256;
+/// The newest schema this worker understands; restores refuse newer backups.
+pub(crate) const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -65,21 +70,33 @@ struct LegacyBookmark {
 }
 
 pub struct Repository {
-    conn: Connection,
-    index: Vec<Bookmark>,
+    pub(crate) conn: Connection,
+    pub(crate) index: Vec<Bookmark>,
+    pub(crate) data_dir: PathBuf,
 }
 
 impl Repository {
     pub fn open(db_path: &Path, legacy_path: &Path) -> Result<Self, RepositoryError> {
         if let Some(parent) = db_path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
         }
-        let conn = Connection::open(db_path)?;
+        restrict_database_files(db_path)?;
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW | OpenFlags::SQLITE_OPEN_URI,
+        )?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let mut this = Self {
             conn,
             index: Vec::new(),
+            data_dir: db_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
         };
         this.migrate_schema()?;
         this.migrate_legacy_once(legacy_path)?;
@@ -119,23 +136,24 @@ impl Repository {
                 |r| r.get(0),
             )
             .optional()?;
-        if done.is_some() || !path.exists() {
+        if done.is_some() {
             return Ok(());
         }
-        let metadata = fs::symlink_metadata(path)?;
-        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-            return Err(RepositoryError::Legacy(
-                "bookmarks.json is not a regular file".into(),
-            ));
+        // Checked without following symlinks, so a dangling link is reported
+        // rather than silently treated as "no legacy data".
+        match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            _ => {}
         }
-        if metadata.len() > MAX_STORE_BYTES {
-            return Err(RepositoryError::Legacy(
-                "bookmarks.json exceeds the 64 MiB safety limit".into(),
-            ));
-        }
-        let raw = fs::read(path)?;
-        let doc: LegacyDocument = serde_json::from_slice(&raw)
-            .map_err(|e| RepositoryError::Legacy(format!("bookmarks.json is malformed ({e})")))?;
+        let raw = read_legacy(path)?;
+        // Only the position is reported; serde messages can quote file content.
+        let doc: LegacyDocument = serde_json::from_slice(&raw).map_err(|e| {
+            RepositoryError::Legacy(format!(
+                "bookmarks.json is malformed near line {}, column {}",
+                e.line(),
+                e.column()
+            ))
+        })?;
         if doc.version.unwrap_or(0) > 3 {
             return Err(RepositoryError::Legacy(
                 "bookmarks.json uses an unsupported newer format".into(),
@@ -155,7 +173,7 @@ impl Repository {
             } else {
                 item.id.clone()
             };
-            if id.len() > 256 || !ids.insert(id.clone()) {
+            if id.len() > MAX_ID || !ids.insert(id.clone()) {
                 return Err(RepositoryError::Legacy(
                     "duplicate or invalid bookmark ID".into(),
                 ));
@@ -169,7 +187,12 @@ impl Repository {
             prepared.push((id, url, key, item));
         }
         let backup = timestamped_backup(path)?;
-        fs::copy(path, &backup)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backup)?
+            .write_all(&raw)?;
         let tx = self.conn.transaction()?;
         for (id, url, key, item) in prepared {
             let now = Utc::now().timestamp_millis();
@@ -246,6 +269,14 @@ impl Repository {
         )
         .map_err(RepositoryError::Validation)?;
         let (url, key) = normalize_url(&input.url).map_err(RepositoryError::Validation)?;
+        if input.id.len() > MAX_ID {
+            return Err(RepositoryError::Validation("Bookmark ID is invalid".into()));
+        }
+        if self.index.len() >= MAX_BOOKMARKS {
+            return Err(RepositoryError::Validation(format!(
+                "The library is limited to {MAX_BOOKMARKS} bookmarks"
+            )));
+        }
         if self
             .conn
             .query_row(
@@ -277,7 +308,7 @@ impl Repository {
     }
 
     pub fn edit(&mut self, input: BookmarkInput) -> Result<Bookmark, RepositoryError> {
-        if input.id.is_empty() {
+        if input.id.is_empty() || input.id.len() > MAX_ID {
             return Err(RepositoryError::Validation(
                 "Bookmark ID is required".into(),
             ));
@@ -318,9 +349,16 @@ impl Repository {
     }
 
     pub fn record_open(&mut self, id: &str) -> Result<(), RepositoryError> {
-        self.conn.execute("UPDATE bookmarks SET usage_score=usage_score+1,last_opened_at=?,modified_at=modified_at WHERE id=?",
-                          params![Utc::now().timestamp_millis(),id])?;
-        self.refresh_index()?;
+        let now = Utc::now().timestamp_millis();
+        self.conn.execute(
+            "UPDATE bookmarks SET usage_score=usage_score+1,last_opened_at=? WHERE id=?",
+            params![now, id],
+        )?;
+        // Only usage changed, so update the index in place instead of reloading.
+        if let Some(bookmark) = self.index.iter_mut().find(|b| b.id == id) {
+            bookmark.usage_score += 1.0;
+            bookmark.last_opened_at = now;
+        }
         Ok(())
     }
 
@@ -342,7 +380,59 @@ impl Repository {
         tags
     }
 
-    fn refresh_index(&mut self) -> Result<(), RepositoryError> {
+    /// Checks the database against the same limits the worker enforces on
+    /// input before loading it, so an externally edited or corrupted database
+    /// cannot exhaust memory.
+    fn check_store_bounds(&self) -> Result<(), RepositoryError> {
+        self.check_bounds_in("main")
+    }
+
+    /// Checks a database attached under `schema` (`main` or an attached
+    /// backup) against the store limits.
+    pub(crate) fn check_bounds_in(&self, schema: &str) -> Result<(), RepositoryError> {
+        let (count, bytes, oversized): (i64, i64, i64) = self.conn.query_row(
+            &format!(
+                "SELECT count(*),
+               COALESCE(sum(length(CAST(id AS BLOB)) + length(CAST(original_url AS BLOB))
+                 + length(CAST(title AS BLOB)) + length(CAST(description AS BLOB))
+                 + length(CAST(keyword AS BLOB))), 0),
+               COALESCE(max(length(CAST(id AS BLOB)) > ?1 OR length(CAST(original_url AS BLOB)) > ?2
+                 OR length(CAST(title AS BLOB)) > ?3 OR length(CAST(description AS BLOB)) > ?4
+                 OR length(CAST(keyword AS BLOB)) > ?5), 0)
+             FROM {schema}.bookmarks"
+            ),
+            params![
+                MAX_ID as i64,
+                crate::url_key::MAX_URL_LEN as i64,
+                MAX_TITLE as i64,
+                MAX_DESCRIPTION as i64,
+                MAX_KEYWORD as i64
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let (tag_bytes, most_tags, longest_tag): (i64, i64, i64) = self.conn.query_row(
+            &format!("SELECT COALESCE(sum(length(CAST(t.name AS BLOB))), 0),
+               COALESCE((SELECT max(n) FROM (SELECT count(*) n FROM {schema}.bookmark_tags GROUP BY bookmark_id)), 0),
+               COALESCE((SELECT max(length(CAST(name AS BLOB))) FROM {schema}.tags), 0)
+             FROM {schema}.bookmark_tags bt JOIN {schema}.tags t ON t.id = bt.tag_id"),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if count as usize > MAX_BOOKMARKS
+            || oversized != 0
+            || most_tags as usize > MAX_TAGS
+            || longest_tag as usize > MAX_TAG
+            || (bytes + tag_bytes) as u64 > MAX_STORE_BYTES
+        {
+            return Err(RepositoryError::Validation(
+                "The bookmark database exceeds safety limits".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_index(&mut self) -> Result<(), RepositoryError> {
+        self.check_store_bounds()?;
         let mut stmt=self.conn.prepare("SELECT b.id,b.original_url,b.title,b.description,b.keyword,b.created_at,b.modified_at,b.usage_score,b.last_opened_at,COALESCE(group_concat(t.name,char(31)),'') FROM bookmarks b LEFT JOIN bookmark_tags bt ON bt.bookmark_id=b.id LEFT JOIN tags t ON t.id=bt.tag_id GROUP BY b.id ORDER BY b.id")?;
         self.index = stmt
             .query_map([], |r| {
@@ -383,7 +473,7 @@ fn validate_settings(settings: &UserSettings) -> Result<(), RepositoryError> {
     Ok(())
 }
 
-fn validate_fields(
+pub(crate) fn validate_fields(
     title: &str,
     description: &str,
     tags: &[String],
@@ -398,7 +488,7 @@ fn validate_fields(
     if tags.len() > MAX_TAGS
         || tags
             .iter()
-            .any(|t| t.trim().is_empty() || t.len() > MAX_TAG)
+            .any(|t| t.trim().is_empty() || t.len() > MAX_TAG || t.chars().any(char::is_control))
     {
         return Err("Tags exceed safety limits".into());
     }
@@ -407,7 +497,11 @@ fn validate_fields(
     }
     Ok(())
 }
-fn replace_tags(tx: &Transaction<'_>, id: &str, tags: &[String]) -> Result<(), rusqlite::Error> {
+pub(crate) fn replace_tags(
+    tx: &Transaction<'_>,
+    id: &str,
+    tags: &[String],
+) -> Result<(), rusqlite::Error> {
     tx.execute("DELETE FROM bookmark_tags WHERE bookmark_id=?", [id])?;
     let mut seen = HashSet::new();
     for raw in tags {
@@ -419,6 +513,65 @@ fn replace_tags(tx: &Transaction<'_>, id: &str, tags: &[String]) -> Result<(), r
         tx.execute("INSERT INTO bookmark_tags(bookmark_id,tag_id) SELECT ?,id FROM tags WHERE name=? COLLATE NOCASE",params![id,tag])?;
     }
     Ok(())
+}
+/// Bookmarks are private, so the database and SQLite's journal files are
+/// readable only by the user. SQLite gives new journal files the database's
+/// permissions, so creating the database with mode 0600 covers future files.
+fn restrict_database_files(db_path: &Path) -> Result<(), RepositoryError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(db_path)?;
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && metadata.file_type().is_file()
+            && metadata.permissions().mode() & 0o077 != 0
+        {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+/// Opens the legacy file without following symlinks or blocking on FIFOs,
+/// then validates and reads it from the same descriptor.
+fn read_legacy(path: &Path) -> Result<Vec<u8>, RepositoryError> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                RepositoryError::Legacy("bookmarks.json is not a regular file".into())
+            } else {
+                RepositoryError::Io(e)
+            }
+        })?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(RepositoryError::Legacy(
+            "bookmarks.json is not a regular file".into(),
+        ));
+    }
+    if metadata.len() > MAX_STORE_BYTES {
+        return Err(RepositoryError::Legacy(
+            "bookmarks.json exceeds the 64 MiB safety limit".into(),
+        ));
+    }
+    let mut raw = Vec::new();
+    file.take(MAX_STORE_BYTES + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_STORE_BYTES {
+        return Err(RepositoryError::Legacy(
+            "bookmarks.json exceeds the 64 MiB safety limit".into(),
+        ));
+    }
+    Ok(raw)
 }
 fn timestamped_backup(path: &Path) -> Result<PathBuf, std::io::Error> {
     let stamp = SystemTime::now()

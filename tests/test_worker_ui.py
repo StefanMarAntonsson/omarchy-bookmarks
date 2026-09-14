@@ -62,6 +62,17 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn("delta > 0 ? 0 : results.length - 1", self.ui)
         self.assertIn("searchField.text = String(item.originalUrl", self.ui)
 
+    def test_enter_opens_first_search_result_when_nothing_is_selected(self):
+        activate_start = self.ui.index("function activateCurrent(invertOpeningPreference)")
+        activate_end = self.ui.index("function activateSelected", activate_start)
+        activate_region = self.ui[activate_start:activate_end]
+        self.assertIn(
+            "if (!item && query.trim() && !searchLoading && results.length)",
+            activate_region,
+        )
+        self.assertIn("selectedIndex = 0", activate_region)
+        self.assertIn("item = selectedResult()", activate_region)
+
     def test_preview_can_restore_the_original_search(self):
         self.assertIn("property bool previewingSelection: false", self.ui)
         self.assertIn("property bool editingPreviewUrl: false", self.ui)
@@ -143,7 +154,7 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn("event.nativeScanCode", self.ui)
         self.assertIn("visible: !controller.altHeld", self.ui)
         self.assertIn(
-            "visible: controller.altHeld && controller.alternateBrowsers.length > 0",
+            "visible: controller.altHeld && controller.browsers.length > 0",
             self.ui,
         )
         self.assertIn('text: "Ctrl+Alt+" + (index + 1)', self.ui)
@@ -154,6 +165,14 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn('sequence: "Ctrl+Alt+" + String(index + 1)', self.ui)
         self.assertIn("root.activateCurrentInBrowser(modelData.id)", self.ui)
         self.assertIn('browser_id: String(browserId)', self.ui)
+
+    def test_all_browsers_action_has_a_shortcut_and_worker_commands(self):
+        self.assertIn('text: "Ctrl+Alt+A"', self.ui)
+        self.assertIn('text: "All browsers"', self.ui)
+        self.assertIn('sequence: "Ctrl+Alt+A"', self.ui)
+        self.assertIn("root.activateCurrentInAllBrowsers()", self.ui)
+        self.assertIn('type: "open_all"', self.ui)
+        self.assertIn('type: "open_url_all"', self.ui)
 
     def test_nonempty_results_use_a_configurable_scrollable_viewport(self):
         self.assertIn("id: searchResults", self.ui)
@@ -170,6 +189,10 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn('type: "save_settings"', self.ui)
         self.assertIn('text: "Default search"', self.ui)
         self.assertIn('text: "Visible results"', self.ui)
+        self.assertIn('text: "Empty search shows"', self.ui)
+        self.assertIn('text: "Most used"', self.ui)
+        self.assertIn('text: "Recently used"', self.ui)
+        self.assertIn('defaultResultOrder: draftDefaultResultOrder', self.ui)
         self.assertIn("Math.min(10", self.ui)
         self.assertIn("model: root.maximumResultCount - 2", self.ui)
         self.assertIn('text: "Open bookmarks"', self.ui)
@@ -225,10 +248,23 @@ class WorkerUiContractTests(unittest.TestCase):
     def test_worker_protocol_and_restart_are_bounded(self):
         self.assertIn("stdinEnabled: true", self.client)
         self.assertIn("SplitParser", self.client)
-        self.assertIn("encoded.length > 64 * 1024", self.client)
+        self.assertIn("utf8Length(encoded) > maxRequestBytes", self.client)
+        self.assertIn("readonly property int maxRequestBytes: 64 * 1024", self.client)
         self.assertIn("line.length > root.maxLineCharacters", self.client)
         self.assertIn("Math.min(10000", self.client)
-        self.assertIn("Math.min(root.restartAttempt + 1, 6)", self.client)
+        self.assertIn("root.restartAttempt >= root.maxAutomaticRestarts", self.client)
+
+    def test_startup_failures_do_not_restart_in_a_loop(self):
+        self.assertIn("if (!wasRunning || root.restartAttempt >= root.maxAutomaticRestarts)", self.client)
+        self.assertIn("root.handshakeComplete = true", self.client)
+        self.assertIn("worker.start()", self.ui)
+
+    def test_every_request_is_resolved_or_times_out(self):
+        self.assertIn("pending[id] = Date.now() + requestTimeoutMs", self.client)
+        self.assertIn("id: watchdog", self.client)
+        self.assertIn('root.killReason = "Bookmark worker stopped responding"', self.client)
+        self.assertIn("root.abandonPending(", self.client)
+        self.assertIn("root.message({version: 1, id: Number(ids[i]), ok: false", self.client)
 
     def test_worker_failure_releases_ready_state_and_restarts(self):
         self.assertIn("onExited", self.client)
@@ -248,6 +284,45 @@ class WorkerUiContractTests(unittest.TestCase):
     def test_untrusted_titles_are_plain_text(self):
         position = self.ui.index("text: modelData.title || root.domain(modelData.originalUrl)")
         self.assertIn("textFormat: Text.PlainText", self.ui[position:position + 1000])
+
+    def test_every_text_element_is_plain_text(self):
+        import re
+        for match in re.finditer(r"(?<![A-Za-z.])Text \{", self.ui):
+            depth, end = 1, match.end()
+            while depth:
+                depth += {"{": 1, "}": -1}.get(self.ui[end], 0)
+                end += 1
+            own_properties = self.ui[match.end():end].split("{")[0]
+            with self.subTest(offset=match.start()):
+                self.assertIn("textFormat: Text.PlainText", own_properties)
+        self.assertNotIn("Controls.Button", self.ui)
+        self.assertNotIn("RichText", self.ui)
+        self.assertNotIn("StyledText", self.ui)
+
+    def test_library_actions_are_wired_to_the_worker(self):
+        for request in ['type: "import_sources"', 'type: "import_preview"', 'type: "import_bookmarks"',
+                        'type: "backup_create"', 'type: "backups_list"', 'type: "backup_restore"',
+                        'type: "library_clear"', 'type: "library_load_examples"']:
+            with self.subTest(request=request):
+                self.assertIn(request, self.ui)
+        self.assertIn('text: "Library"', self.ui)
+        self.assertIn("id: libraryPanel", self.ui)
+
+    def test_destructive_library_actions_require_confirmation(self):
+        clear = self.ui[self.ui.index("function confirmClearLibrary()"):]
+        clear = clear[:clear.index("\n  }")]
+        self.assertIn("beginLibraryConfirm(", clear)
+        examples = self.ui[self.ui.index("function confirmLoadExamples()"):]
+        examples = examples[:examples.index("\n  }")]
+        self.assertIn("beginLibraryConfirm(", examples)
+        restore = self.ui[self.ui.index("} else if (mode === \"restore\") {"):]
+        self.assertLess(restore.index("beginLibraryConfirm("), restore.index("libraryRequest("))
+
+    def test_library_failures_release_the_busy_state(self):
+        self.assertIn(
+            'if (libraryRequestId && response.id === libraryRequestId) { libraryRequestId = 0; libraryBusy = false; statusMessage',
+            self.ui,
+        )
 
     def test_hidden_overlay_releases_result_model(self):
         self.assertIn(

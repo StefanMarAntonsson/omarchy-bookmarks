@@ -1,4 +1,4 @@
-use crate::model::Bookmark;
+use crate::model::{Bookmark, DefaultResultOrder};
 
 fn subsequence_score(haystack: &str, needle: &str) -> Option<i64> {
     let mut pos = 0usize;
@@ -31,29 +31,59 @@ fn field_score(field: &str, query: &str, weight: i64) -> i64 {
 }
 
 pub fn rank(index: &[Bookmark], query: &str, limit: usize) -> Vec<Bookmark> {
-    rank_with(index, query, limit, |item, q| {
-        let title = field_score(&item.title, q, 8);
-        let tags = item
-            .tags
-            .iter()
-            .map(|tag| field_score(tag, q, 7))
-            .max()
-            .unwrap_or(0);
-        let keyword = field_score(&item.keyword, q, 6);
-        let url = field_score(&item.original_url, q, 4);
-        let description = field_score(&item.description, q, 2);
-        title.max(tags).max(keyword).max(url).max(description)
-    })
+    rank_in_order(index, query, limit, DefaultResultOrder::MostUsed)
+}
+
+pub fn rank_in_order(
+    index: &[Bookmark],
+    query: &str,
+    limit: usize,
+    order: DefaultResultOrder,
+) -> Vec<Bookmark> {
+    rank_with(
+        index,
+        query,
+        limit,
+        |item, q| {
+            let title = field_score(&item.title, q, 8);
+            let tags = item
+                .tags
+                .iter()
+                .map(|tag| field_score(tag, q, 7))
+                .max()
+                .unwrap_or(0);
+            let keyword = field_score(&item.keyword, q, 6);
+            let url = field_score(&item.original_url, q, 4);
+            let description = field_score(&item.description, q, 2);
+            title.max(tags).max(keyword).max(url).max(description)
+        },
+        order,
+    )
 }
 
 pub fn rank_tags(index: &[Bookmark], query: &str, limit: usize) -> Vec<Bookmark> {
-    rank_with(index, query, limit, |item, q| {
-        item.tags
-            .iter()
-            .map(|tag| field_score(tag, q, 7))
-            .max()
-            .unwrap_or(0)
-    })
+    rank_tags_in_order(index, query, limit, DefaultResultOrder::MostUsed)
+}
+
+pub fn rank_tags_in_order(
+    index: &[Bookmark],
+    query: &str,
+    limit: usize,
+    order: DefaultResultOrder,
+) -> Vec<Bookmark> {
+    rank_with(
+        index,
+        query,
+        limit,
+        |item, q| {
+            item.tags
+                .iter()
+                .map(|tag| field_score(tag, q, 7))
+                .max()
+                .unwrap_or(0)
+        },
+        order,
+    )
 }
 
 fn rank_with(
@@ -61,19 +91,28 @@ fn rank_with(
     query: &str,
     limit: usize,
     score_item: impl Fn(&Bookmark, &str) -> i64,
+    order: DefaultResultOrder,
 ) -> Vec<Bookmark> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
-        let mut most_used: Vec<&Bookmark> = index.iter().collect();
-        most_used.sort_by(|a, b| {
-            b.usage_score
-                .total_cmp(&a.usage_score)
-                .then_with(|| b.last_opened_at.cmp(&a.last_opened_at))
+        let mut defaults: Vec<&Bookmark> = index.iter().collect();
+        defaults.sort_by(|a, b| {
+            let primary = match order {
+                DefaultResultOrder::MostUsed => b
+                    .usage_score
+                    .total_cmp(&a.usage_score)
+                    .then_with(|| b.last_opened_at.cmp(&a.last_opened_at)),
+                DefaultResultOrder::RecentlyUsed => b
+                    .last_opened_at
+                    .cmp(&a.last_opened_at)
+                    .then_with(|| b.usage_score.total_cmp(&a.usage_score)),
+            };
+            primary
                 .then_with(|| b.created_at.cmp(&a.created_at))
                 .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
                 .then_with(|| a.id.cmp(&b.id))
         });
-        return most_used.into_iter().take(limit).cloned().collect();
+        return defaults.into_iter().take(limit).cloned().collect();
     }
     let mut scored: Vec<(i64, &Bookmark)> = index
         .iter()
@@ -150,6 +189,28 @@ mod tests {
             .map(|index| b(&format!("item-{index}"), &format!("Item {index}")))
             .collect();
         assert_eq!(rank(&bookmarks, "", 10).len(), 10);
+    }
+    #[test]
+    fn empty_can_return_most_recently_used() {
+        let mut frequent = b("frequent", "Frequent");
+        frequent.usage_score = 10.0;
+        frequent.last_opened_at = 20;
+        let mut recent = b("recent", "Recent");
+        recent.usage_score = 1.0;
+        recent.last_opened_at = 30;
+        let mut never_opened = b("never-opened", "Never opened");
+        never_opened.created_at = 40;
+
+        let got = rank_in_order(
+            &[frequent, recent, never_opened],
+            "",
+            3,
+            DefaultResultOrder::RecentlyUsed,
+        );
+        assert_eq!(
+            got.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            vec!["recent", "frequent", "never-opened"]
+        );
     }
     #[test]
     fn exact_then_prefix_then_substring() {

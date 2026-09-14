@@ -1,6 +1,6 @@
 use omarchy_bookmarks_worker::{
     Repository,
-    model::{BookmarkInput, UserSettings},
+    model::{BookmarkInput, DefaultResultOrder, UserSettings},
     protocol::{self, Command, Effect, Request, SearchScope},
 };
 use std::{fs, path::Path};
@@ -283,6 +283,7 @@ fn settings_have_safe_defaults_validate_and_persist() {
         assert_eq!(r.settings().unwrap(), UserSettings::default());
         let saved = UserSettings {
             default_search_scope: "tags".into(),
+            default_result_order: DefaultResultOrder::RecentlyUsed,
             result_count: 10,
             open_in_new_window: true,
             fetch_page_details: false,
@@ -308,9 +309,467 @@ fn settings_have_safe_defaults_validate_and_persist() {
         r.settings().unwrap(),
         UserSettings {
             default_search_scope: "tags".into(),
+            default_result_order: DefaultResultOrder::RecentlyUsed,
             result_count: 10,
             open_in_new_window: true,
             fetch_page_details: false,
         }
     );
+}
+
+#[test]
+fn settings_saved_before_result_order_was_added_keep_the_default() {
+    let d = tempdir().unwrap();
+    let db = d.path().join("db");
+    let missing = d.path().join("none");
+    {
+        let _r = Repository::open(&db, &missing).unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection.execute(
+            "INSERT INTO app_metadata(key,value) VALUES('user_settings_v1',?)",
+            [r#"{"defaultSearchScope":"all","resultCount":5,"openInNewWindow":false,"fetchPageDetails":false}"#],
+        ).unwrap();
+    }
+    let r = Repository::open(&db, &missing).unwrap();
+    assert_eq!(
+        r.settings().unwrap().default_result_order,
+        DefaultResultOrder::MostUsed
+    );
+}
+
+fn search(r: &mut Repository, query: &str, limit: usize, offset: usize) -> serde_json::Value {
+    let Effect::Response(response) = protocol::handle(
+        r,
+        Request {
+            version: 1,
+            id: 1,
+            command: Command::Search {
+                query: query.into(),
+                limit,
+                offset,
+                scope: SearchScope::All,
+            },
+        },
+    ) else {
+        panic!()
+    };
+    let encoded = protocol::encode_response(&response);
+    assert!(encoded.len() <= protocol::MAX_RESPONSE);
+    serde_json::from_str(&encoded).unwrap()
+}
+
+#[test]
+fn empty_search_uses_the_saved_result_order() {
+    let d = tempdir().unwrap();
+    let mut r = Repository::open(&d.path().join("db"), &d.path().join("none")).unwrap();
+    let frequent = r
+        .add(input("", "https://frequent.test", "Frequent"))
+        .unwrap();
+    let recent = r.add(input("", "https://recent.test", "Recent")).unwrap();
+    r.record_open(&frequent.id).unwrap();
+    r.record_open(&frequent.id).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    r.record_open(&recent.id).unwrap();
+
+    assert_eq!(
+        search(&mut r, "", 2, 0)["result"]["items"][0]["id"],
+        frequent.id
+    );
+    r.save_settings(UserSettings {
+        default_result_order: DefaultResultOrder::RecentlyUsed,
+        ..UserSettings::default()
+    })
+    .unwrap();
+    assert_eq!(
+        search(&mut r, "", 2, 0)["result"]["items"][0]["id"],
+        recent.id
+    );
+}
+
+#[test]
+fn maximum_size_bookmarks_are_paged_within_the_response_limit() {
+    let d = tempdir().unwrap();
+    let mut r = Repository::open(&d.path().join("db"), &d.path().join("none")).unwrap();
+    for n in 0..12 {
+        let mut item = input("", &format!("https://example.test/{n}"), &"\"".repeat(2048));
+        item.description = "\u{1}".repeat(8192);
+        item.tags = (0..64)
+            .map(|t| format!("{t}{}", "\"".repeat(120)))
+            .collect();
+        r.add(item).unwrap();
+    }
+    // Empty queries show one page of most-used bookmarks, shortened to fit.
+    let result = search(&mut r, "", 10, 0);
+    assert_eq!(result["ok"], true);
+    let items = result["result"]["items"].as_array().unwrap().len();
+    assert!((1..10).contains(&items));
+    let mut offset = 0;
+    loop {
+        let result = search(&mut r, "example", 10, offset);
+        assert_eq!(result["ok"], true);
+        let page = result["result"]["items"].as_array().unwrap().len();
+        assert!(page >= 1);
+        offset += page;
+        if result["result"]["hasMore"] != true {
+            break;
+        }
+    }
+    assert_eq!(offset, 12);
+}
+
+#[test]
+fn page_lookup_is_refused_unless_enabled_in_saved_settings() {
+    let d = tempdir().unwrap();
+    let mut r = Repository::open(&d.path().join("db"), &d.path().join("none")).unwrap();
+    let request = |id| Request {
+        version: 1,
+        id,
+        command: Command::FetchMetadata {
+            url: "https://example.test/".into(),
+            metadata_request_id: 1,
+        },
+    };
+    let Effect::Response(response) = protocol::handle(&mut r, request(1)) else {
+        panic!("lookup must not start while disabled")
+    };
+    assert!(!response.ok);
+    r.save_settings(UserSettings {
+        fetch_page_details: true,
+        ..UserSettings::default()
+    })
+    .unwrap();
+    assert!(matches!(
+        protocol::handle(&mut r, request(2)),
+        Effect::Metadata { .. }
+    ));
+}
+
+#[test]
+fn legacy_fifo_and_symlink_are_rejected_without_blocking() {
+    let d = tempdir().unwrap();
+    let fifo = d.path().join("fifo.json");
+    let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let err = Repository::open(&d.path().join("a.sqlite3"), &fifo)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("not a regular file"), "{err}");
+
+    let target = d.path().join("real.json");
+    legacy(&target, r#"{"version":3,"bookmarks":[]}"#);
+    let link = d.path().join("link.json");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let err = Repository::open(&d.path().join("b.sqlite3"), &link)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("not a regular file"), "{err}");
+}
+
+#[test]
+fn malformed_legacy_errors_do_not_quote_file_content() {
+    let d = tempdir().unwrap();
+    let json = d.path().join("bookmarks.json");
+    legacy(
+        &json,
+        r#"{"version":3,"bookmarks":[{"url":"https://a.test","usageScore":"<img src=x>"}]}"#,
+    );
+    let err = Repository::open(&d.path().join("db"), &json)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("line 1"), "{err}");
+    assert!(!err.contains("<img"), "{err}");
+}
+
+#[test]
+fn externally_inflated_database_fails_closed() {
+    let d = tempdir().unwrap();
+    let db = d.path().join("db");
+    {
+        let mut r = Repository::open(&db, &d.path().join("none")).unwrap();
+        r.add(input("", "https://one.test", "One")).unwrap();
+    }
+    let c = rusqlite::Connection::open(&db).unwrap();
+    c.execute("UPDATE bookmarks SET description=?", [&"x".repeat(100_000)])
+        .unwrap();
+    drop(c);
+    let err = Repository::open(&db, &d.path().join("none"))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("safety limits"), "{err}");
+}
+
+#[test]
+fn database_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempdir().unwrap();
+    let db = d.path().join("data").join("bookmarks.sqlite3");
+    {
+        let mut r = Repository::open(&db, &d.path().join("none")).unwrap();
+        r.add(input("", "https://one.test", "One")).unwrap();
+    }
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+    let _r = Repository::open(&db, &d.path().join("none")).unwrap();
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&db), 0o600);
+    assert_eq!(mode(db.parent().unwrap()), 0o700);
+    let wal = db.with_file_name("bookmarks.sqlite3-wal");
+    if wal.exists() {
+        assert_eq!(mode(&wal), 0o600);
+    }
+}
+
+#[test]
+fn opening_records_usage_and_rejects_oversized_ids() {
+    let d = tempdir().unwrap();
+    let mut r = Repository::open(&d.path().join("db"), &d.path().join("none")).unwrap();
+    let b = r.add(input("", "https://one.test", "One")).unwrap();
+    r.record_open(&b.id).unwrap();
+    assert_eq!(r.get(&b.id).unwrap().usage_score, 1.0);
+    assert!(
+        r.add(input(&"i".repeat(300), "https://two.test", "Two"))
+            .is_err()
+    );
+    let mut tagged = input("", "https://three.test", "Three");
+    tagged.tags = vec!["a\u{1f}b".into()];
+    assert!(r.add(tagged).is_err());
+}
+
+mod library {
+    use super::*;
+    use omarchy_bookmarks_worker::{
+        import::{ImportRead, ImportedBookmark},
+        library::BackupReason,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    fn tagged(url: &str, title: &str, tags: &[&str]) -> BookmarkInput {
+        let mut item = input("", url, title);
+        item.tags = tags.iter().map(|t| t.to_string()).collect();
+        item
+    }
+
+    fn summary(r: &Repository) -> Vec<(String, Vec<String>)> {
+        let mut rows: Vec<_> = r
+            .all()
+            .iter()
+            .map(|b| {
+                let mut tags = b.tags.clone();
+                tags.sort();
+                (b.original_url.clone(), tags)
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn backup_clear_and_restore_round_trip_keeps_settings() {
+        let d = tempdir().unwrap();
+        let mut r =
+            Repository::open(&d.path().join("bookmarks.sqlite3"), &d.path().join("none")).unwrap();
+        r.add(tagged("https://one.test/", "One", &["a", "b"]))
+            .unwrap();
+        r.add(tagged("https://two.test/", "Two", &["b"])).unwrap();
+        let before = summary(&r);
+        let backup = r.create_backup(BackupReason::Manual).unwrap();
+        assert_eq!(backup.bookmarks, 2);
+        let mode = fs::metadata(r.backups_dir().join(&backup.name))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let (removed, clear_backup) = r.clear_library().unwrap();
+        assert_eq!(removed, 2);
+        assert!(clear_backup.is_some());
+        assert!(r.all().is_empty());
+        r.save_settings(UserSettings {
+            result_count: 7,
+            ..UserSettings::default()
+        })
+        .unwrap();
+
+        // Restoring into an empty library needs no safety backup.
+        assert_eq!(r.restore_backup(&backup.name).unwrap(), None);
+        assert_eq!(summary(&r), before);
+        assert_eq!(r.settings().unwrap().result_count, 7);
+
+        let listed = r.list_backups().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].reason, "before-clear");
+        assert!(listed.iter().all(|b| b.bookmarks == 2));
+
+        // Reopening sees the restored library.
+        drop(r);
+        let r =
+            Repository::open(&d.path().join("bookmarks.sqlite3"), &d.path().join("none")).unwrap();
+        assert_eq!(summary(&r), before);
+    }
+
+    #[test]
+    fn restore_refuses_unknown_names_and_damaged_files_without_changes() {
+        let d = tempdir().unwrap();
+        let mut r =
+            Repository::open(&d.path().join("bookmarks.sqlite3"), &d.path().join("none")).unwrap();
+        r.add(input("", "https://keep.test/", "Keep")).unwrap();
+        for name in [
+            "../bookmarks.sqlite3",
+            "bookmarks.sqlite3",
+            "bookmarks-20260101T000000000Z-manual.sqlite3",
+        ] {
+            assert!(r.restore_backup(name).is_err(), "{name}");
+        }
+        fs::create_dir_all(r.backups_dir()).unwrap();
+        let damaged = "bookmarks-20260101T000000000Z-manual.sqlite3";
+        fs::write(r.backups_dir().join(damaged), b"not a database").unwrap();
+        assert!(r.restore_backup(damaged).is_err());
+        let foreign = "bookmarks-20260101T000001000Z-manual.sqlite3";
+        rusqlite::Connection::open(r.backups_dir().join(foreign))
+            .unwrap()
+            .execute_batch("CREATE TABLE other(x);")
+            .unwrap();
+        assert!(r.restore_backup(foreign).is_err());
+        assert_eq!(r.all().len(), 1);
+        // A failed restore never leaves a safety backup behind.
+        assert!(
+            r.list_backups()
+                .unwrap()
+                .iter()
+                .all(|b| b.reason == "manual")
+        );
+    }
+
+    #[test]
+    fn restore_refuses_backups_from_newer_versions() {
+        let d = tempdir().unwrap();
+        let mut r =
+            Repository::open(&d.path().join("bookmarks.sqlite3"), &d.path().join("none")).unwrap();
+        r.add(input("", "https://one.test/", "One")).unwrap();
+        let backup = r.create_backup(BackupReason::Manual).unwrap();
+        let path = r.backups_dir().join(&backup.name);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("INSERT INTO schema_migrations VALUES(99, 0)", [])
+            .unwrap();
+        let err = r.restore_backup(&backup.name).unwrap_err().to_string();
+        assert!(err.contains("newer"), "{err}");
+    }
+
+    #[test]
+    fn examples_replace_the_library_and_can_be_undone() {
+        let d = tempdir().unwrap();
+        let mut r =
+            Repository::open(&d.path().join("bookmarks.sqlite3"), &d.path().join("none")).unwrap();
+        r.add(input("", "https://mine.test/", "Mine")).unwrap();
+        let (added, backup) = r.load_examples().unwrap();
+        assert!(added >= 20);
+        assert_eq!(r.all().len(), added);
+        let top = search(&mut r, "", 5, 0);
+        assert_eq!(top["result"]["items"][0]["title"], "The Omarchy Manual");
+        r.restore_backup(&backup.unwrap()).unwrap();
+        assert_eq!(r.all().len(), 1);
+        assert_eq!(r.all()[0].title, "Mine");
+    }
+
+    #[test]
+    fn automatic_backups_are_pruned_but_manual_ones_are_kept() {
+        let d = tempdir().unwrap();
+        let mut r =
+            Repository::open(&d.path().join("bookmarks.sqlite3"), &d.path().join("none")).unwrap();
+        r.add(input("", "https://one.test/", "One")).unwrap();
+        let manual = r.create_backup(BackupReason::Manual).unwrap();
+        for _ in 0..25 {
+            r.create_backup(BackupReason::BeforeImport).unwrap();
+        }
+        let listed = r.list_backups().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|b| b.reason == "before-import")
+                .count(),
+            20
+        );
+        assert!(listed.iter().any(|b| b.name == manual.name));
+    }
+
+    fn imported(url: &str, title: &str, tags: &[&str]) -> ImportedBookmark {
+        let (url, key) = omarchy_bookmarks_worker::url_key::normalize_url(url).unwrap();
+        ImportedBookmark {
+            url,
+            key,
+            title: title.into(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            keyword: String::new(),
+            created_at: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn import_adds_only_new_bookmarks_after_a_backup() {
+        let d = tempdir().unwrap();
+        let mut r =
+            Repository::open(&d.path().join("bookmarks.sqlite3"), &d.path().join("none")).unwrap();
+        r.add(input("", "https://existing.test/", "Existing title"))
+            .unwrap();
+        let read = ImportRead {
+            bookmarks: vec![
+                imported("https://existing.test/", "Browser title", &[]),
+                imported("https://new.test/", "New", &["from-browser"]),
+            ],
+            skipped: 2,
+            duplicates: 1,
+        };
+        let preview = r.preview_import(&read);
+        assert_eq!(
+            (
+                preview.found,
+                preview.new,
+                preview.already_saved,
+                preview.skipped
+            ),
+            (5, 1, 1, 3)
+        );
+        let summary = r.import(read).unwrap();
+        assert_eq!(summary.added, 1);
+        assert!(summary.backup.is_some());
+        assert_eq!(r.all().len(), 2);
+        let existing = r.find_url("https://existing.test/").unwrap().unwrap();
+        assert_eq!(existing.title, "Existing title");
+        let new = r.find_url("https://new.test/").unwrap().unwrap();
+        assert_eq!(new.tags, ["from-browser"]);
+        assert_eq!(new.created_at, 1_700_000_000_000);
+
+        let again = r.import(ImportRead {
+            bookmarks: vec![imported("https://new.test/", "New", &[])],
+            ..ImportRead::default()
+        });
+        let again = again.unwrap();
+        assert_eq!(again.added, 0);
+        assert!(again.backup.is_none());
+    }
+
+    #[test]
+    fn protocol_refuses_import_sources_it_did_not_discover() {
+        let d = tempdir().unwrap();
+        let mut r = Repository::open(&d.path().join("db"), &d.path().join("none")).unwrap();
+        let Effect::Response(response) = protocol::handle(
+            &mut r,
+            Request {
+                version: 1,
+                id: 1,
+                command: Command::ImportPreview {
+                    source_id: "/etc/passwd".into(),
+                },
+            },
+        ) else {
+            panic!()
+        };
+        assert!(!response.ok);
+    }
 }
