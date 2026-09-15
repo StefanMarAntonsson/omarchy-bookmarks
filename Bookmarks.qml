@@ -54,8 +54,6 @@ Item {
   property var suggestedTags: []
   property bool controlHeld: false
   property bool altHeld: false
-  property var browsers: []
-  property int browsersRequestId: 0
   // Library screens (import, restore, confirmations) share one request slot.
   property string noticeMessage: ""
   property bool libraryBusy: false
@@ -64,9 +62,6 @@ Item {
   property int libraryIndex: 0
   property var importPreview: null
   property var pendingLibraryAction: null
-  property bool browsersLoading: false
-  property string browsersError: ""
-  readonly property var alternateBrowsers: root.browsers.filter(function(browser) { return !browser.isDefault }).slice(0, 9)
   readonly property real menuCornerRadius: Math.max(Style.cornerRadius, Style.space(12))
   readonly property real contentCornerRadius: Math.max(1, root.menuCornerRadius - Math.max(1, Style.space(4)))
   readonly property real resultWindowHeight: Style.space(58) * root.resultCount + Style.spacing.xs * (root.resultCount - 1)
@@ -109,11 +104,10 @@ Item {
     noticeMessage = ""
     query = ""; searchField.text = ""; results = []; defaultResults = []; selectedIndex = -1; latestSearchId = 0; searchLoading = false; searchHasMore = false; noResultsState = false; pendingSelectionIndex = -1
     previewingSelection = false; editingPreviewUrl = false; openUrlRequestId = 0; addUrlRequestId = 0; pendingAddUrl = ""
-    mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false; browsersError = ""; opened = true
+    mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false; opened = true
     worker.start()
     requestSettings()
     performSearch()
-    requestBrowsers()
     Qt.callLater(function() { searchField.forceActiveFocus() })
   }
   function close() { opened = false; query = ""; searchField.text = ""; results = []; defaultResults = []; selectedIndex = -1; pendingSelectionIndex = -1; noResultsState = false; previewingSelection = false; editingPreviewUrl = false; openUrlRequestId = 0; addUrlRequestId = 0; pendingAddUrl = ""; mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false; noticeMessage = ""; importPreview = null; pendingLibraryAction = null; if (!libraryBusy) libraryItems = [] }
@@ -254,13 +248,6 @@ Item {
     }
     target.item.forceActiveFocus()
   }
-  function requestBrowsers() {
-    var requestId = worker.request({type: "browsers"})
-    if (!requestId) return
-    browsersRequestId = requestId
-    browsersLoading = true
-    browsersError = ""
-  }
   function shortcutIndex(slot) {
     return query.trim() ? searchResults.visibleStartIndex + slot : slot
   }
@@ -313,9 +300,9 @@ Item {
       ? (delta > 0 ? 0 : results.length - 1)
       : ((selectedIndex + delta) % results.length + results.length) % results.length
   }
-  function activateIndex(index) {
+  function activateIndex(index, invertOpeningPreference) {
     if (index < 0 || index >= results.length) return
-    previewingSelection = false; editingPreviewUrl = false; selectedIndex = index; activateCurrent(false)
+    previewingSelection = false; editingPreviewUrl = false; selectedIndex = index; activateCurrent(Boolean(invertOpeningPreference))
   }
   function requestOpen(body) {
     if (openUrlRequestId) return
@@ -323,54 +310,29 @@ Item {
     openUrlRequestId = worker.request(body)
     if (!openUrlRequestId) statusMessage = worker.error || "Worker is unavailable"
   }
-  function requestOpenUrl(url, invertOpeningPreference, browserId) {
+  function requestOpenUrl(url, invertOpeningPreference) {
     var useNewWindow = invertOpeningPreference ? !openInNewWindow : openInNewWindow
-    requestOpen({type: "open_url", url: String(url || "").trim(), new_window: browserId ? false : useNewWindow, browser_id: browserId ? String(browserId) : null})
+    requestOpen({type: "open_url", url: String(url || "").trim(), new_window: useNewWindow})
   }
   function activateCurrent(invertOpeningPreference) {
-    if (editingPreviewUrl) { requestOpenUrl(searchField.text, invertOpeningPreference, null); return }
+    if (editingPreviewUrl) { requestOpenUrl(searchField.text, invertOpeningPreference); return }
     var item = selectedResult()
     if (!item && query.trim() && !searchLoading && results.length) {
       selectedIndex = 0
       item = selectedResult()
     }
     if (item) {
-      if (item.action === "open_url") requestOpenUrl(item.url, invertOpeningPreference, null)
+      if (item.action === "open_url") requestOpenUrl(item.url, invertOpeningPreference)
       else activateSelected(invertOpeningPreference)
       return
     }
-    if (looksLikeWebUrl(searchField.text)) requestOpenUrl(searchField.text, invertOpeningPreference, null)
+    if (looksLikeWebUrl(searchField.text)) requestOpenUrl(searchField.text, invertOpeningPreference)
   }
   function activateSelected(invertOpeningPreference) {
     var item = selectedResult(); if (!item) return
-    if (item.action === "open_url") { requestOpenUrl(item.url, invertOpeningPreference, null); return }
+    if (item.action === "open_url") { requestOpenUrl(item.url, invertOpeningPreference); return }
     var useNewWindow = invertOpeningPreference ? !openInNewWindow : openInNewWindow
     requestOpen({type: "open", bookmark_id: item.id, new_window: useNewWindow})
-  }
-  function activateCurrentInBrowser(browserId) {
-    if (editingPreviewUrl) { requestOpenUrl(searchField.text, false, browserId); return }
-    var item = selectedResult()
-    if (!item) {
-      if (looksLikeWebUrl(searchField.text)) requestOpenUrl(searchField.text, false, browserId)
-      return
-    }
-    if (item.action === "open_url") { requestOpenUrl(item.url, false, browserId); return }
-    if (item.action) return
-    requestOpen({type: "open", bookmark_id: item.id, new_window: false, browser_id: String(browserId)})
-  }
-  function requestOpenUrlInAllBrowsers(url) {
-    requestOpen({type: "open_url_all", url: String(url || "").trim()})
-  }
-  function activateCurrentInAllBrowsers() {
-    if (editingPreviewUrl) { requestOpenUrlInAllBrowsers(searchField.text); return }
-    var item = selectedResult()
-    if (!item) {
-      if (looksLikeWebUrl(searchField.text)) requestOpenUrlInAllBrowsers(searchField.text)
-      return
-    }
-    if (item.action === "open_url") { requestOpenUrlInAllBrowsers(item.url); return }
-    if (item.action) return
-    requestOpen({type: "open_all", bookmark_id: item.id})
   }
   function requestAddCurrentUrl() {
     if (addUrlRequestId) return
@@ -557,7 +519,6 @@ Item {
       if (deleteRequestId && response.id === deleteRequestId) { deleteRequestId = 0; statusMessage = String(response.error || "Could not delete bookmark"); return }
       if (response.id === settingsRequestId) { statusMessage = String(response.error || "Could not load settings"); return }
       if (settingsSaveRequestId && response.id === settingsSaveRequestId) { settingsSaveRequestId = 0; statusMessage = String(response.error || "Could not save settings"); return }
-      if (response.id === browsersRequestId) { browsersLoading = false; browsersError = String(response.error || "Could not find browsers"); return }
       if (response.id === latestSearchId) { searchLoading = false; results = []; noResultsState = false }
       statusMessage = String(response.error || "Bookmark operation failed"); return
     }
@@ -599,10 +560,6 @@ Item {
       performSearch()
       Qt.callLater(function() { searchField.forceActiveFocus() })
       return
-    }
-    if (response.id === browsersRequestId) {
-      browsers = Array.isArray(result.browsers) ? result.browsers : []
-      browsersLoading = false; browsersError = ""; return
     }
     if (response.id === latestSearchId) {
       if (String(result.query || "") !== query || String(result.scope || "all") !== searchScope) return
@@ -662,13 +619,12 @@ Item {
 
     Row {
       id: bookmarkActions
-      visible: !controller.altHeld
       anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
       spacing: Style.spacing.md
 
       Repeater {
         model: [
-          {key: "Ctrl+T", label: controller.openInNewWindow ? "Open in new tab" : "Open in new window"},
+          {key: "Ctrl+Enter", label: controller.openInNewWindow ? "Open in new tab" : "Open in new window"},
           {key: "Ctrl+C", label: "Copy URL"},
           {key: "Ctrl+E", label: "Edit"}
         ]
@@ -692,62 +648,6 @@ Item {
       }
     }
 
-    Row {
-      id: browserActions
-      visible: controller.altHeld && controller.browsers.length > 0
-      anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
-      spacing: Style.spacing.md
-
-      Column {
-        width: (browserActions.width - browserActions.spacing * controller.alternateBrowsers.length) / (controller.alternateBrowsers.length + 1)
-        spacing: Style.spacing.xs
-        Text {
-          textFormat: Text.PlainText
-          width: parent.width; text: "Ctrl+Alt+A"; color: Color.menu.selectedText
-          font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium
-          elide: Text.ElideRight
-        }
-        Text {
-          width: parent.width; text: "All browsers"; textFormat: Text.PlainText
-          color: Color.menu.selectedText; opacity: 0.72
-          font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
-        }
-      }
-
-      Repeater {
-        model: controller.alternateBrowsers
-        delegate: Column {
-          required property int index
-          required property var modelData
-          width: (browserActions.width - browserActions.spacing * controller.alternateBrowsers.length) / (controller.alternateBrowsers.length + 1)
-          spacing: Style.spacing.xs
-          Text {
-            textFormat: Text.PlainText
-            width: parent.width; text: "Ctrl+Alt+" + (index + 1); color: Color.menu.selectedText
-            font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium
-            elide: Text.ElideRight
-          }
-          Text {
-            width: parent.width; text: modelData.name; textFormat: Text.PlainText
-            color: Color.menu.selectedText; opacity: 0.72
-            font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-          }
-        }
-      }
-    }
-
-    Text {
-      textFormat: Text.PlainText
-      visible: controller.altHeld && controller.browsers.length === 0
-      anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
-      text: controller.browsersLoading ? "Finding browsers…" : controller.browsersError ? controller.browsersError : "No browsers configured"
-      color: controller.browsersError ? Color.urgent : Color.menu.selectedText
-      opacity: controller.browsersError ? 1 : 0.72
-      font.family: Style.font.menuFamily; font.pixelSize: Style.font.bodySmall
-      elide: Text.ElideRight
-    }
   }
 
   // Clips its content and, while active, scrolls overflowing content horizontally:
@@ -850,7 +750,7 @@ Item {
   WorkerClient {
     id: worker
     launcherPath: root.workerLauncher
-    onReadyChanged: if (ready && root.opened) { root.requestSettings(); root.performSearch(); root.requestBrowsers() }
+    onReadyChanged: if (ready && root.opened) { root.requestSettings(); root.performSearch() }
     onMessage: function(response) { root.handleMessage(response) }
   }
   Timer { id: searchDebounce; interval: 35; repeat: false; onTriggered: root.performSearch() }
@@ -891,25 +791,6 @@ Item {
       Keys.onReleased: function(event) { root.updateModifierState(event, false) }
       MouseArea { anchors.fill: parent; onClicked: {} }
 
-      Instantiator {
-        model: root.alternateBrowsers
-        delegate: Shortcut {
-          required property int index
-          required property var modelData
-          sequence: "Ctrl+Alt+" + String(index + 1)
-          enabled: root.opened && root.mode === "search" && index < 9
-          autoRepeat: false
-          onActivated: root.activateCurrentInBrowser(modelData.id)
-        }
-      }
-
-      Shortcut {
-        sequence: "Ctrl+Alt+A"
-        enabled: root.opened && root.mode === "search" && root.browsers.length > 0
-        autoRepeat: false
-        onActivated: root.activateCurrentInAllBrowsers()
-      }
-
       Shortcut {
         sequence: "Ctrl+S"
         enabled: root.opened && root.mode === "search"
@@ -933,7 +814,8 @@ Item {
           id: searchField
           visible: root.mode === "search"; width: parent.width; height: Style.space(46); text: root.query
           leftPadding: Style.spacing.md; rightPadding: Style.spacing.md
-          placeholderText: root.controlHeld && !root.altHeld && text.length === 0 ? "" : root.searchScope === "tags" ? "Search tags" : "Search bookmarks"; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading
+          cursorVisible: !root.controlHeld
+          placeholderText: root.controlHeld && text.length === 0 ? "" : root.searchScope === "tags" ? "Search tags" : "Search bookmarks"; font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading
           color: Color.menu.text; selectionColor: Util.alpha(Color.menu.selectedText, 0.24); selectedTextColor: Color.menu.text; selectByMouse: true
           background: Rectangle {
             color: Util.alpha(Color.menu.text, 0.035); radius: root.contentCornerRadius
@@ -947,9 +829,11 @@ Item {
           }
           Text {
             textFormat: Text.PlainText
-            visible: root.controlHeld && !root.altHeld && searchField.text.length === 0
+            visible: root.controlHeld && searchField.text.length === 0
             anchors.centerIn: parent
-            text: "Ctrl+N   Add bookmark     Ctrl+S   Settings"
+            text: root.altHeld
+              ? "Ctrl+Alt+number   " + (root.openInNewWindow ? "Open in new tab" : "Open in new window")
+              : "Ctrl+N   Add bookmark     Ctrl+V   Paste     Ctrl+S   Settings"
             color: Color.menu.text
             opacity: 0.72
             font.family: Style.font.menuFamily
@@ -992,12 +876,13 @@ Item {
             else if (root.query.trim() && event.key === Qt.Key_Up) { root.moveSelection(-1); event.accepted = true }
             else if (root.query.trim() && event.key === Qt.Key_Down) { root.moveSelection(1); event.accepted = true }
             else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && worker.setupRequired) { root.startWorkerSetup(); event.accepted = true }
+            else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && event.modifiers === Qt.ControlModifier) { root.activateCurrent(true); event.accepted = true }
             else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.activateCurrent(false); event.accepted = true }
-            else if (event.modifiers === Qt.ControlModifier && directSlot >= 0 && directSlot < root.resultCount) { root.activateIndex(root.shortcutIndex(directSlot)); event.accepted = true }
+            else if (event.modifiers === (Qt.ControlModifier | Qt.AltModifier) && directSlot >= 0 && directSlot < root.resultCount) { root.activateIndex(root.shortcutIndex(directSlot), true); event.accepted = true }
+            else if (event.modifiers === Qt.ControlModifier && directSlot >= 0 && directSlot < root.resultCount) { root.activateIndex(root.shortcutIndex(directSlot), false); event.accepted = true }
             else if (event.key === Qt.Key_N && event.modifiers === Qt.ControlModifier) { root.requestAddCurrentUrl(); event.accepted = true }
             else if (event.key === Qt.Key_S && event.modifiers === Qt.ControlModifier) { root.beginSettings(); event.accepted = true }
             else if (event.key === Qt.Key_E && event.modifiers === Qt.ControlModifier) { root.beginEdit(); event.accepted = true }
-            else if (event.key === Qt.Key_T && event.modifiers === Qt.ControlModifier) { root.activateCurrent(true); event.accepted = true }
             else if (event.key === Qt.Key_C && event.modifiers === Qt.ControlModifier && !root.editingPreviewUrl && root.selectedResult() && !root.selectedResult().action) { worker.request({type:"copy",bookmark_id:root.selectedResult().id}); event.accepted=true }
             else if (event.key === Qt.Key_D && event.modifiers === Qt.ControlModifier) { root.requestDelete(); event.accepted = true }
           }
@@ -1045,7 +930,7 @@ Item {
               width: topBookmarks.width; height: Style.space(58); radius: root.contentCornerRadius
               color: index === root.selectedIndex ? Color.menu.selectedBackground : "transparent"
               MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: root.selectedIndex = index; onClicked: root.activateIndex(index) }
-              Text { id: topShortcutHint; textFormat: Text.PlainText; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld; text: "Ctrl+" + root.resultShortcutKey(index); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+              Text { id: topShortcutHint; textFormat: Text.PlainText; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld; text: (root.altHeld ? "Ctrl+Alt+" : "Ctrl+") + root.resultShortcutKey(index); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
               Column {
                 visible: !parent.showingShortcuts
                 anchors.left: parent.left; anchors.right: topShortcutHint.visible ? topShortcutHint.left : parent.right; anchors.verticalCenter: parent.verticalCenter
@@ -1088,7 +973,7 @@ Item {
               width: contentColumn.width; height: Style.space(58); radius: root.contentCornerRadius
               color: index === root.selectedIndex ? Color.menu.selectedBackground : "transparent"
               MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: if (!root.editingPreviewUrl) root.previewSelection(index); onClicked: root.activateIndex(index) }
-              Text { id: shortcutHint; textFormat: Text.PlainText; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld && index >= searchResults.visibleStartIndex && index < searchResults.visibleStartIndex + root.resultCount; text: "Ctrl+" + root.resultShortcutKey(index - searchResults.visibleStartIndex); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
+              Text { id: shortcutHint; textFormat: Text.PlainText; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld && index >= searchResults.visibleStartIndex && index < searchResults.visibleStartIndex + root.resultCount; text: (root.altHeld ? "Ctrl+Alt+" : "Ctrl+") + root.resultShortcutKey(index - searchResults.visibleStartIndex); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
               Column {
                 visible: !parent.showingShortcuts
                 anchors.left: parent.left; anchors.right: shortcutHint.visible ? shortcutHint.left : parent.right; anchors.verticalCenter: parent.verticalCenter

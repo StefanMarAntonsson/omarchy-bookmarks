@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    Repository, browser, import,
+    Repository, import,
     library::BackupReason,
     metadata,
     model::{BookmarkInput, DefaultResultOrder, UserSettings},
@@ -15,8 +15,6 @@ pub const MAX_RESPONSE: usize = 256 * 1024;
 pub const MAX_RESULTS: usize = 10;
 /// Space kept free for the response envelope and non-item fields.
 const RESPONSE_OVERHEAD: usize = 4 * 1024;
-/// The default browser plus the nine alternates reachable by shortcut.
-const MAX_REPORTED_BROWSERS: usize = 10;
 /// Restore choices shown at once; older backups remain on disk.
 const MAX_REPORTED_BACKUPS: usize = 30;
 
@@ -89,23 +87,12 @@ pub enum Command {
         bookmark_id: String,
         #[serde(default)]
         new_window: bool,
-        #[serde(default)]
-        browser_id: Option<String>,
     },
     OpenUrl {
         url: String,
         #[serde(default)]
         new_window: bool,
-        #[serde(default)]
-        browser_id: Option<String>,
     },
-    OpenAll {
-        bookmark_id: String,
-    },
-    OpenUrlAll {
-        url: String,
-    },
-    Browsers,
     GetSettings,
     SaveSettings {
         settings: UserSettings,
@@ -281,19 +268,11 @@ pub fn handle(repo: &mut Repository, request: Request) -> Effect {
         Command::Open {
             bookmark_id,
             new_window,
-            browser_id,
-        } => open(repo, &bookmark_id, new_window, browser_id.as_deref()),
+        } => open(repo, &bookmark_id, new_window),
         Command::OpenUrl {
             url,
             new_window,
-            browser_id,
-        } => open_url(&url, new_window, browser_id.as_deref()),
-        Command::OpenAll { bookmark_id } => open_all(repo, &bookmark_id),
-        Command::OpenUrlAll { url } => open_url_all(&url),
-        Command::Browsers => browser::discover().map(|mut browsers| {
-            browsers.truncate(MAX_REPORTED_BROWSERS);
-            json!({"browsers":browsers})
-        }),
+        } => open_url(&url, new_window),
         Command::GetSettings => repo
             .settings()
             .map(|settings| json!({"settings":settings}))
@@ -375,80 +354,26 @@ fn metadata_allowed(repo: &Repository, url: &str) -> Result<String, String> {
     }
     crate::url_key::normalize_url(url).map(|(url, _)| url)
 }
-fn open(
-    repo: &mut Repository,
-    id: &str,
-    new_window: bool,
-    browser_id: Option<&str>,
-) -> Result<Value, String> {
+fn open(repo: &mut Repository, id: &str, new_window: bool) -> Result<Value, String> {
     let b = repo.get(id).ok_or("Bookmark no longer exists")?;
     // Stored URLs are validated again so an edited database cannot pass
     // arbitrary arguments to the browser launcher.
     let (validated_url, _) = crate::url_key::normalize_url(&b.original_url)?;
-    launch_url(&validated_url, new_window, browser_id)?;
+    launch_url(&validated_url, new_window)?;
     repo.record_open(id).map_err(|e| e.to_string())?;
     Ok(json!({"opened":true}))
 }
-fn open_url(url: &str, new_window: bool, browser_id: Option<&str>) -> Result<Value, String> {
+fn open_url(url: &str, new_window: bool) -> Result<Value, String> {
     let (validated_url, _) = crate::url_key::normalize_url(url)?;
-    launch_url(&validated_url, new_window, browser_id)?;
+    launch_url(&validated_url, new_window)?;
     Ok(json!({"opened":true}))
 }
-fn open_all(repo: &mut Repository, id: &str) -> Result<Value, String> {
-    let b = repo.get(id).ok_or("Bookmark no longer exists")?;
-    let (validated_url, _) = crate::url_key::normalize_url(&b.original_url)?;
-    let count = launch_url_in_all_browsers(&validated_url)?;
-    repo.record_open(id).map_err(|e| e.to_string())?;
-    Ok(json!({"opened":true,"browsers":count}))
-}
-fn open_url_all(url: &str) -> Result<Value, String> {
-    let (validated_url, _) = crate::url_key::normalize_url(url)?;
-    let count = launch_url_in_all_browsers(&validated_url)?;
-    Ok(json!({"opened":true,"browsers":count}))
-}
-fn launch_url(url: &str, new_window: bool, browser_id: Option<&str>) -> Result<(), String> {
-    if let Some(browser_id) = browser_id {
-        let selected = browser::find(browser_id)?;
-        return launch_in_browser(url, &selected);
-    }
+fn launch_url(url: &str, new_window: bool) -> Result<(), String> {
     let mut command = std::process::Command::new("omarchy-launch-browser");
     if new_window {
         command.arg("--new-window");
     }
     command.arg(url);
-    let child = command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Could not open browser: {e}"))?;
-    reap(child);
-    Ok(())
-}
-fn launch_url_in_all_browsers(url: &str) -> Result<usize, String> {
-    let browsers = browser::discover()?;
-    if browsers.is_empty() {
-        return Err("No browsers are configured".into());
-    }
-    for selected in &browsers {
-        launch_in_browser(url, selected)?;
-    }
-    Ok(browsers.len())
-}
-fn launch_in_browser(url: &str, selected: &browser::Browser) -> Result<(), String> {
-    let mut command = std::process::Command::new("systemd-run");
-    command.args([
-        "--user",
-        "--quiet",
-        "--collect",
-        "--property=StandardOutput=null",
-        "--property=StandardError=null",
-        "uwsm-app",
-        "--",
-        "gio",
-        "launch",
-    ]);
-    command.arg(&selected.desktop_path).arg(url);
     let child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -529,29 +454,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_open_all_requests() {
-        let request =
-            parse_request(r#"{"version":1,"id":8,"type":"open_all","bookmark_id":"bookmark-1"}"#)
-                .unwrap();
-        assert!(matches!(
-            request.command,
-            Command::OpenAll { bookmark_id } if bookmark_id == "bookmark-1"
-        ));
-
-        let request = parse_request(
-            r#"{"version":1,"id":9,"type":"open_url_all","url":"https://example.test"}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            request.command,
-            Command::OpenUrlAll { url } if url == "https://example.test"
-        ));
+    fn removed_multi_browser_requests_are_rejected() {
+        for request in [
+            r#"{"version":1,"id":8,"type":"browsers"}"#,
+            r#"{"version":1,"id":9,"type":"open_all","bookmark_id":"bookmark-1"}"#,
+            r#"{"version":1,"id":10,"type":"open_url_all","url":"https://example.test"}"#,
+        ] {
+            assert!(parse_request(request).is_err(), "{request}");
+        }
     }
 
     #[test]
     fn direct_urls_require_valid_http_or_https_syntax() {
-        assert!(open_url("youtube.com", false, None).is_err());
-        assert!(open_url("javascript:alert(1)", false, None).is_err());
-        assert!(open_url("https://user:pass@example.test", false, None).is_err());
+        assert!(open_url("youtube.com", false).is_err());
+        assert!(open_url("javascript:alert(1)", false).is_err());
+        assert!(open_url("https://user:pass@example.test", false).is_err());
     }
 }

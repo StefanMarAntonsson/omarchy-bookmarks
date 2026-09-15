@@ -21,7 +21,7 @@ class WorkerUiContractTests(unittest.TestCase):
     def test_empty_query_uses_normal_result_rows(self):
         self.assertIn("id: topBookmarks", self.ui)
         self.assertIn("model: root.results", self.ui)
-        self.assertIn('text: "Ctrl+" + root.resultShortcutKey(index)', self.ui)
+        self.assertIn('(root.altHeld ? "Ctrl+Alt+" : "Ctrl+")', self.ui)
         top_start = self.ui.index("id: topBookmarks")
         search_start = self.ui.index('visible: root.mode === "search" && root.query.trim().length > 0')
         top_region = self.ui[top_start:search_start]
@@ -86,6 +86,14 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn("selectedIndex = 0", activate_region)
         self.assertIn("item = selectedResult()", activate_region)
 
+    def test_ctrl_enter_uses_the_inverse_opening_preference_for_selection(self):
+        self.assertIn(
+            "(event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && event.modifiers === Qt.ControlModifier",
+            self.ui,
+        )
+        self.assertIn("root.activateCurrent(true)", self.ui)
+        self.assertIn('{key: "Ctrl+Enter"', self.ui)
+
     def test_preview_can_restore_the_original_search(self):
         self.assertIn("property bool previewingSelection: false", self.ui)
         self.assertIn("property bool editingPreviewUrl: false", self.ui)
@@ -148,44 +156,54 @@ class WorkerUiContractTests(unittest.TestCase):
     def test_ctrl_digit_opens_the_matching_result(self):
         self.assertIn("key >= Qt.Key_1 && key <= Qt.Key_9", self.ui)
         self.assertIn("return key === Qt.Key_0 ? 9 : -1", self.ui)
-        self.assertIn("root.activateIndex(root.shortcutIndex(directSlot))", self.ui)
+        self.assertIn(
+            "root.activateIndex(root.shortcutIndex(directSlot), false)",
+            self.ui,
+        )
         self.assertIn("index >= results.length) return", self.ui)
-        self.assertIn('text: "Ctrl+" + root.resultShortcutKey(index)', self.ui)
+        self.assertIn('(root.altHeld ? "Ctrl+Alt+" : "Ctrl+")', self.ui)
 
     def test_ctrl_hints_only_appear_while_control_is_held(self):
         self.assertIn("property bool controlHeld: false", self.ui)
         self.assertIn("event.key === Qt.Key_Control", self.ui)
         self.assertIn("visible: root.controlHeld", self.ui)
         self.assertIn("component ResultShortcutContent: Item", self.ui)
-        self.assertIn('text: "Ctrl+N   Add bookmark     Ctrl+S   Settings"', self.ui)
-        self.assertNotIn("id: controlOverlay", self.ui)
-
-    def test_ctrl_alt_replaces_bookmark_actions_with_browser_actions(self):
-        self.assertIn("property bool altHeld: false", self.ui)
-        self.assertIn("function updateModifierState(event, pressed)", self.ui)
-        self.assertIn("event.nativeVirtualKey", self.ui)
-        self.assertIn("event.nativeScanCode", self.ui)
-        self.assertIn("visible: !controller.altHeld", self.ui)
         self.assertIn(
-            "visible: controller.altHeld && controller.browsers.length > 0",
+            '"Ctrl+N   Add bookmark     Ctrl+V   Paste     Ctrl+S   Settings"',
             self.ui,
         )
-        self.assertIn('text: "Ctrl+Alt+" + (index + 1)', self.ui)
+        self.assertIn("cursorVisible: !root.controlHeld", self.ui)
+        self.assertNotIn("id: controlOverlay", self.ui)
 
-    def test_alternate_browsers_are_loaded_and_have_shortcuts(self):
-        self.assertIn('worker.request({type: "browsers"})', self.ui)
-        self.assertIn("root.browsers.filter", self.ui)
-        self.assertIn('sequence: "Ctrl+Alt+" + String(index + 1)', self.ui)
-        self.assertIn("root.activateCurrentInBrowser(modelData.id)", self.ui)
-        self.assertIn('browser_id: String(browserId)', self.ui)
+    def test_ctrl_alt_hint_describes_the_inverse_opening_behavior(self):
+        self.assertIn('"Ctrl+Alt+number   "', self.ui)
+        self.assertIn(
+            'root.openInNewWindow ? "Open in new tab" : "Open in new window"',
+            self.ui,
+        )
 
-    def test_all_browsers_action_has_a_shortcut_and_worker_commands(self):
-        self.assertIn('text: "Ctrl+Alt+A"', self.ui)
-        self.assertIn('text: "All browsers"', self.ui)
-        self.assertIn('sequence: "Ctrl+Alt+A"', self.ui)
-        self.assertIn("root.activateCurrentInAllBrowsers()", self.ui)
-        self.assertIn('type: "open_all"', self.ui)
-        self.assertIn('type: "open_url_all"', self.ui)
+    def test_ctrl_alt_digit_opens_the_matching_result_with_inverse_preference(self):
+        self.assertIn(
+            "event.modifiers === (Qt.ControlModifier | Qt.AltModifier)",
+            self.ui,
+        )
+        self.assertIn(
+            "root.activateIndex(root.shortcutIndex(directSlot), true)",
+            self.ui,
+        )
+        self.assertIn('property bool altHeld: false', self.ui)
+        self.assertIn('(root.altHeld ? "Ctrl+Alt+" : "Ctrl+")', self.ui)
+        self.assertNotIn('Ctrl+T', self.ui)
+
+    def test_multi_browser_opening_is_not_exposed(self):
+        for removed in (
+            'type: "browsers"',
+            'browser_id',
+            'type: "open_all"',
+            'type: "open_url_all"',
+            'All browsers',
+        ):
+            self.assertNotIn(removed, self.ui)
 
     def test_open_failures_remain_visible_before_the_overlay_closes(self):
         self.assertIn("function requestOpen(body)", self.ui)

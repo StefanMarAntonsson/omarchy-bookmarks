@@ -129,8 +129,6 @@ than switching versions back and forth.
   legacy migration, and the refreshed in-memory index.
 - `src/search.rs`, `src/url_key.rs`, and `src/metadata.rs` own ranking,
   conservative duplicate keys, and bounded HTTP metadata retrieval.
-- `src/browser.rs` discovers registered HTTPS handlers from XDG desktop files,
-  identifies the default, and resolves explicit browser launches.
 
 QML never reads SQLite, performs network requests, or scans the bookmark
 collection. Requests are limited to 64 KiB (measured in UTF-8 bytes, and read
@@ -148,14 +146,11 @@ The worker launches existing desktop tools and does not install software:
 | Tool | Used for |
 | --- | --- |
 | `omarchy-launch-browser` | Opening URLs in the default browser |
-| `systemd-run --user`, `uwsm-app`, `gio` | Opening a URL in an explicitly chosen alternate browser (`Ctrl+Alt+number`) or every detected browser (`Ctrl+Alt+A`) |
 | `wl-copy` | Copying a bookmark URL |
 
-`systemd-run` is used only to start the chosen browser's desktop entry in a
-transient user scope, so the browser does not become a child of the shell. It
-does not create, modify, or manage services. Launched helpers are waited on so
-the long-running worker does not accumulate zombie processes. URLs, including
-stored ones, are validated as HTTP(S) immediately before every launch.
+Launched helpers are waited on so the long-running worker does not accumulate
+zombie processes. URLs, including stored ones, are validated as HTTP(S)
+immediately before every launch.
 
 Setup uses `sha256sum`, `flock`, and `curl` for a pinned release, or a Rust 1.96
 or newer toolchain (`cargo`) when building from source, and
@@ -259,17 +254,16 @@ omarchy-shell shell toggle stefanmara.bookmarks '{}'
 | `Up` / `Down` | Change selection and preview its URL while searching |
 | Edit a previewed URL | Clear the bookmark selection and use the field as a direct URL |
 | `Enter` | Open the selected bookmark, the first search result when none is selected, or a valid HTTP/HTTPS URL in the field |
+| `Ctrl+Enter` | Open the selected bookmark, first result, or direct URL using the opposite of the configured opening behavior |
 | `Ctrl+1` – `Ctrl+9`, `Ctrl+0` | Open results 1–10 directly |
-| Hold `Ctrl` | Replace the selected row with its actions and reveal result-row shortcuts; an empty input shows `Ctrl+N` and `Ctrl+S` |
-| Hold `Ctrl+Alt` | Replace the selected row actions with configured non-default browsers |
+| `Ctrl+Alt+1` – `Ctrl+Alt+9`, `Ctrl+Alt+0` | Open results 1–10 using the opposite of the configured opening behavior |
+| Hold `Ctrl` | Replace the selected row with its actions and reveal result-row shortcuts; an empty input shows add, paste, and settings shortcuts |
+| Hold `Ctrl+Alt` | Reveal the inverse numbered shortcuts and whether they open in a new tab or window |
 | `Ctrl+N` | Add a bookmark, prefilling a valid non-duplicate URL from the field |
 | `Ctrl+S` | Open settings |
 | `Ctrl+E` | Edit the selected bookmark |
 | `Ctrl+D` | Request deletion of the selected bookmark; `Enter` confirms |
 | `Ctrl+C` | Copy the selected URL |
-| `Ctrl+T` | Use the opposite of the configured opening behavior |
-| `Ctrl+Alt+1` – `Ctrl+Alt+9` | Open the selected bookmark or direct URL in the corresponding configured non-default browser |
-| `Ctrl+Alt+A` | Open the selected bookmark or direct URL in every detected browser |
 | `Escape` | Restore the search from a URL preview/edit; press again to close |
 
 Settings use the same in-card form as adding a bookmark. They control the
