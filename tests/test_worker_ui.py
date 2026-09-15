@@ -200,6 +200,8 @@ class WorkerUiContractTests(unittest.TestCase):
             "event.key === Qt.Key_D && event.modifiers === Qt.ControlModifier",
             self.ui,
         )
+        self.assertIn('{key: "Ctrl+D", label: "Delete"}', self.ui)
+        self.assertIn("(bookmarkActions.width - bookmarkActions.spacing * 3) / 4", self.ui)
         self.assertNotIn("event.key === Qt.Key_Delete", self.ui)
 
     def test_down_at_loaded_page_end_fetches_and_selects_the_next_result(self):
@@ -224,15 +226,19 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn("event.key === Qt.Key_Control", self.ui)
         self.assertIn("visible: root.controlHeld", self.ui)
         self.assertIn("component ResultShortcutContent: Item", self.ui)
-        self.assertIn(
-            '"Ctrl+N   Add bookmark     Ctrl+V   Paste     Ctrl+S   Settings"',
-            self.ui,
-        )
+        for hint in ['"Ctrl+N"', '"Add bookmark"', '"Ctrl+V"', '"Paste"', '"Ctrl+S"', '"Settings"']:
+            with self.subTest(hint=hint):
+                self.assertIn(hint, self.ui)
+        self.assertIn("id: shortcutHintRow", self.ui)
+        self.assertEqual(self.ui.count("width: shortcutHintRow.width / 3"), 3)
+        self.assertNotIn("color: Util.alpha(Color.menu.text, 0.2)", self.ui)
+        self.assertGreaterEqual(self.ui.count("font.pixelSize: Style.font.caption"), 3)
         self.assertIn("cursorVisible: !root.controlHeld", self.ui)
         self.assertNotIn("id: controlOverlay", self.ui)
 
     def test_ctrl_alt_hint_describes_the_inverse_opening_behavior(self):
-        self.assertIn('"Ctrl+Alt+number   "', self.ui)
+        self.assertIn('text: "Ctrl+Alt+Number"', self.ui)
+        self.assertIn("id: altShortcutHint", self.ui)
         self.assertIn(
             'root.openInNewWindow ? "Open in new tab" : "Open in new window"',
             self.ui,

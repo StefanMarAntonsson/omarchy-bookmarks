@@ -679,23 +679,24 @@ Item {
         model: [
           {key: "Ctrl+Enter", label: controller.openInNewWindow ? "Open in new tab" : "Open in new window"},
           {key: "Ctrl+C", label: "Copy URL"},
-          {key: "Ctrl+E", label: "Edit"}
+          {key: "Ctrl+E", label: "Edit"},
+          {key: "Ctrl+D", label: "Delete"}
         ]
         delegate: Column {
           required property var modelData
-          width: (bookmarkActions.width - bookmarkActions.spacing * 2) / 3
+          width: (bookmarkActions.width - bookmarkActions.spacing * 3) / 4
           spacing: Style.spacing.xs
           Text {
             textFormat: Text.PlainText
             width: parent.width; text: modelData.key; color: Color.menu.selectedText
             font.family: Style.font.menuFamily; font.pixelSize: Style.font.heading; font.weight: Font.Medium
-            elide: Text.ElideRight
+            horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight
           }
           Text {
             textFormat: Text.PlainText
             width: parent.width; text: modelData.label; color: Color.menu.selectedText; opacity: 0.72
             font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
+            horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight
           }
         }
       }
@@ -883,17 +884,81 @@ Item {
               border.color: Util.alpha(Color.menu.selectedText, 0.42)
             }
           }
-          Text {
-            textFormat: Text.PlainText
-            visible: root.controlHeld && searchField.text.length === 0
-            anchors.centerIn: parent
-            text: root.altHeld
-              ? "Ctrl+Alt+number   " + (root.openInNewWindow ? "Open in new tab" : "Open in new window")
-              : "Ctrl+N   Add bookmark     Ctrl+V   Paste     Ctrl+S   Settings"
-            color: Color.menu.text
-            opacity: 0.72
-            font.family: Style.font.menuFamily
-            font.pixelSize: Style.font.bodySmall
+          Column {
+            id: altShortcutHint
+            visible: root.controlHeld && root.altHeld && searchField.text.length === 0
+            anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md
+            spacing: Style.space(1)
+            Text {
+              width: parent.width; text: "Ctrl+Alt+Number"; textFormat: Text.PlainText
+              horizontalAlignment: Text.AlignHCenter
+              color: Color.menu.selectedText; opacity: 0.82
+              font.family: Style.font.menuFamily; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium
+            }
+            Text {
+              width: parent.width; text: root.openInNewWindow ? "Open in new tab" : "Open in new window"; textFormat: Text.PlainText
+              horizontalAlignment: Text.AlignHCenter
+              color: Color.menu.selectedText; opacity: 0.55
+              font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+            }
+          }
+          Row {
+            id: shortcutHintRow
+            visible: root.controlHeld && !root.altHeld && searchField.text.length === 0
+            anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md
+            height: addShortcutHint.implicitHeight
+            spacing: 0
+            Column {
+              id: addShortcutHint
+              width: shortcutHintRow.width / 3
+              spacing: Style.space(1)
+              Text {
+                width: parent.width; text: "Ctrl+N"; textFormat: Text.PlainText
+                horizontalAlignment: Text.AlignHCenter
+                color: Color.menu.selectedText; opacity: 0.82
+                font.family: Style.font.menuFamily; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium
+              }
+              Text {
+                width: parent.width; text: "Add bookmark"; textFormat: Text.PlainText
+                horizontalAlignment: Text.AlignHCenter
+                color: Color.menu.selectedText; opacity: 0.55
+                font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+              }
+            }
+            Column {
+              width: shortcutHintRow.width / 3
+              spacing: Style.space(1)
+              Text {
+                width: parent.width; text: "Ctrl+V"; textFormat: Text.PlainText
+                horizontalAlignment: Text.AlignHCenter
+                color: Color.menu.selectedText; opacity: 0.82
+                font.family: Style.font.menuFamily; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium
+              }
+              Text {
+                width: parent.width; text: "Paste"; textFormat: Text.PlainText
+                horizontalAlignment: Text.AlignHCenter
+                color: Color.menu.selectedText; opacity: 0.55
+                font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+              }
+            }
+            Column {
+              width: shortcutHintRow.width / 3
+              spacing: Style.space(1)
+              Text {
+                width: parent.width; text: "Ctrl+S"; textFormat: Text.PlainText
+                horizontalAlignment: Text.AlignHCenter
+                color: Color.menu.selectedText; opacity: 0.82
+                font.family: Style.font.menuFamily; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium
+              }
+              Text {
+                width: parent.width; text: "Settings"; textFormat: Text.PlainText
+                horizontalAlignment: Text.AlignHCenter
+                color: Color.menu.selectedText; opacity: 0.55
+                font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption
+              }
+            }
           }
           Rectangle {
             visible: root.previewingSelection || root.editingPreviewUrl || root.query.length > 0
