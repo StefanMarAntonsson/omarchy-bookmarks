@@ -2,4 +2,4 @@ __pycache__/
 target/
 *.py[cod]
 .DS_Store
-/docs/RELEASE-AND-MARKETPLACE-PLAN.md
+/docs/*
