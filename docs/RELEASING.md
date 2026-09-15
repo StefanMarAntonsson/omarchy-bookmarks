@@ -12,8 +12,9 @@ commit a reviewer approves fixes exactly which executable users can install.
 2. Clear the pin's `source`, `x86_64`, and `aarch64` values; step 3 fills
    them in.
 3. Run `./tests/run`.
-4. Optional: run **Release worker** manually from the Actions tab. A manual run
-   builds and tests both architectures but never attests or publishes.
+4. Push the candidate to a `release/*` branch to run **Release worker** without
+   attesting or publishing. Once this workflow exists on the default branch, a
+   manual Actions run provides the same non-publishing rehearsal.
 5. Commit and push.
 
 ## 2. Tag and publish

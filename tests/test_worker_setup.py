@@ -11,6 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ID = ROOT / "scripts" / "worker-source-id.sh"
+PLUGIN_VERSION = json.loads((ROOT / "manifest.json").read_text())["version"]
 
 
 def pin_values():
@@ -47,7 +48,10 @@ class PluginCopy:
         self.binary.write_text("#!/bin/sh\necho started-worker\n")
         self.binary.chmod(stat.S_IRWXU)
         digest = subprocess.run(["sha256sum", str(self.binary)], check=True, capture_output=True, text=True).stdout.split()[0]
-        self.record.write_text(f"origin=source\nversion=2.0.0\nsource={self.source_id()}\nsha256={digest}\n")
+        self.record.write_text(
+            f"origin=source\nversion={PLUGIN_VERSION}\n"
+            f"source={self.source_id()}\nsha256={digest}\n"
+        )
 
     def launch(self):
         environment = dict(os.environ, XDG_DATA_HOME=str(self.data), HOME=self.temp.name)
@@ -144,7 +148,10 @@ class ReleaseContractTests(unittest.TestCase):
                     self.assertRegex(action, r"@[0-9a-f]{40}$")
         release = (ROOT / ".github" / "workflows" / "release.yml").read_text()
         self.assertIn("permissions: {}", release)
-        self.assertIn("if: github.event_name == 'push'", release)
+        self.assertIn('- "release/**"', release)
+        tag_only = "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+        self.assertEqual(release.count(tag_only), 3)
+        self.assertIn("needs: validate", release)
 
     def test_no_unverified_install_paths(self):
         checked = [ROOT / "README.md", ROOT / "worker-launcher.sh", *(ROOT / "scripts").glob("*.sh")]

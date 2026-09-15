@@ -80,10 +80,15 @@ export. Update the existing Git-managed installation with:
 
 ```bash
 omarchy plugin update stefanmara.bookmarks
+omarchy-restart-shell
+omarchy-shell shell summon stefanmara.bookmarks '{}'
 ```
 
-Then open Bookmarks and complete **Set up worker** as described above. On the
-first successful v2 worker start, the version-3
+Review the displayed update diff and confirm it before restarting. The restart
+is required because v1 keeps its service loaded; without it, the old v1 service
+can remain active after the files have updated. After the shell returns,
+summon Bookmarks and complete **Set up worker** as described above. On the first
+successful v2 worker start, the version-3
 `bookmarks.json` used by v1 is validated and migrated to SQLite. IDs, URLs,
 titles, tags, keywords, usage scores, and last-opened times are retained. The
 original JSON remains untouched and a private timestamped migration backup is
@@ -213,7 +218,7 @@ pinned is described in [docs/RELEASING.md](docs/RELEASING.md).
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo test --locked --all-targets
 cargo audit
 shellcheck worker-launcher.sh tests/run scripts/*.sh
 ./tests/run
@@ -313,7 +318,7 @@ Backups are complete SQLite copies made with `VACUUM INTO`, saved with mode
 0600 in:
 
 ```text
-$XDG_DATA_HOME/stefanmara.bookmarks/backups/bookmarks-<UTC time>-<reason>.sqlite3
+${XDG_DATA_HOME:-$HOME/.local/share}/stefanmara.bookmarks/backups/bookmarks-<UTC time>-<reason>.sqlite3
 ```
 
 The newest 20 automatic and 50 manual backups are kept. A restore accepts only
@@ -335,13 +340,13 @@ another file.
 SQLite is authoritative at:
 
 ```text
-$XDG_DATA_HOME/stefanmara.bookmarks/bookmarks.sqlite3
+${XDG_DATA_HOME:-$HOME/.local/share}/stefanmara.bookmarks/bookmarks.sqlite3
 ```
 
 The legacy source remains at:
 
 ```text
-$XDG_DATA_HOME/stefanmara.bookmarks/bookmarks.json
+${XDG_DATA_HOME:-$HOME/.local/share}/stefanmara.bookmarks/bookmarks.json
 ```
 
 A worker refuses to open a database with a newer SQLite schema before making

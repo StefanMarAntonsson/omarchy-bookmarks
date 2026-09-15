@@ -72,7 +72,7 @@ fn fetch_with(url: &str, policy: FetchPolicy) -> Result<Metadata, String> {
         .redirect(redirect_policy(policy.public_only))
         .referer(false)
         .no_proxy()
-        .user_agent("OmarchyBookmarks/2.0");
+        .user_agent(concat!("OmarchyBookmarks/", env!("CARGO_PKG_VERSION")));
     if policy.public_only {
         builder = builder.dns_resolver(Arc::new(PublicResolver {
             timeout: policy.connect_timeout,

@@ -28,6 +28,7 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertIn(f"omarchy-shell shell summon {plugin_id} '{{}}'", readme)
         self.assertIn(f"omarchy plugin update {plugin_id}", readme)
+        self.assertIn("omarchy-restart-shell", readme)
         self.assertIn("~/.config/omarchy/extensions/omarchy-menu.jsonc", readme)
         self.assertIn("~/.config/hypr/bindings.lua", readme)
         self.assertIn("Do not use v1 to make changes after v2 has migrated", readme)
