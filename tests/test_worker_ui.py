@@ -75,6 +75,40 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn("delta > 0 ? 0 : results.length - 1", self.ui)
         self.assertIn("searchField.text = String(item.originalUrl", self.ui)
 
+    def test_result_hover_selection_requires_pointer_movement(self):
+        top_start = self.ui.index("id: topBookmarks")
+        search_start = self.ui.index("id: searchResults")
+        setup_start = self.ui.index("id: workerSetupPrompt")
+        top_region = self.ui[top_start:search_start]
+        search_region = self.ui[search_start:setup_start]
+
+        self.assertIn("onPositionChanged:", top_region)
+        self.assertIn("!root.pointerPlacementPending && index !== root.selectedIndex", top_region)
+        self.assertIn("root.pointerMotionIsIntentional(topPointerArea, event)", top_region)
+        self.assertNotIn("onEntered:", top_region)
+        self.assertIn("onPositionChanged:", search_region)
+        self.assertIn(
+            "!root.pointerPlacementPending && !root.editingPreviewUrl && index !== root.selectedIndex",
+            search_region,
+        )
+        self.assertIn("root.pointerMotionIsIntentional(resultPointerArea, event)", search_region)
+        self.assertNotIn("onEntered:", search_region)
+
+    def test_opening_places_the_pointer_over_the_settled_search_field(self):
+        self.assertIn("import Quickshell.Hyprland", self.ui)
+        self.assertIn("property bool pointerPlacementPending: false", self.ui)
+        self.assertIn("function maybePlacePointerOverSearchField()", self.ui)
+        self.assertIn(
+            "searchField.mapToGlobal(searchField.width / 2, searchField.height / 2)",
+            self.ui,
+        )
+        self.assertIn('"hl.dsp.cursor.move({ x = " + x + ", y = " + y + " })"', self.ui)
+        self.assertIn('"movecursor " + x + " " + y', self.ui)
+        self.assertIn("settlePointerPlacementRequest(response.id)", self.ui)
+        self.assertIn("pointerPlacementGuard.restart()", self.ui)
+        self.assertIn("function pointerMotionIsIntentional(area, event)", self.ui)
+        self.assertIn("area.mapToGlobal(event.x, event.y)", self.ui)
+
     def test_enter_opens_first_search_result_when_nothing_is_selected(self):
         activate_start = self.ui.index("function activateCurrent(invertOpeningPreference)")
         activate_end = self.ui.index("function activateSelected", activate_start)

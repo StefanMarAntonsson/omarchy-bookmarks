@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as Controls
 import QtQml.Models
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
@@ -35,6 +36,12 @@ Item {
   property bool searchHasMore: false
   property bool noResultsState: false
   property int pendingSelectionIndex: -1
+  property bool pointerPlacementPending: false
+  property bool pointerPlacementScheduled: false
+  property int pointerPlacementSettingsId: 0
+  property int pointerPlacementSearchId: 0
+  property real lastPointerEventX: NaN
+  property real lastPointerEventY: NaN
   property bool previewingSelection: false
   property bool editingPreviewUrl: false
   property int openUrlRequestId: 0
@@ -100,17 +107,53 @@ Item {
     if (resolved.indexOf("file://") === 0) resolved = resolved.slice(7)
     try { return decodeURIComponent(resolved) } catch (_) { return resolved }
   }
+  function maybePlacePointerOverSearchField() {
+    if (!pointerPlacementPending || pointerPlacementScheduled || !opened || mode !== "search"
+        || pointerPlacementSettingsId || pointerPlacementSearchId) return
+    pointerPlacementScheduled = true
+    Qt.callLater(function() {
+      root.pointerPlacementScheduled = false
+      if (!root.pointerPlacementPending || !root.opened || root.mode !== "search"
+          || root.pointerPlacementSettingsId || root.pointerPlacementSearchId) return
+      var target = searchField.mapToGlobal(searchField.width / 2, searchField.height / 2)
+      var x = Math.round(target.x)
+      var y = Math.round(target.y)
+      Hyprland.dispatch(Hyprland.usingLua
+        ? "hl.dsp.cursor.move({ x = " + x + ", y = " + y + " })"
+        : "movecursor " + x + " " + y)
+      pointerPlacementGuard.restart()
+    })
+  }
+  function pointerMotionIsIntentional(area, event) {
+    var point = area.mapToGlobal(event.x, event.y)
+    if (!isFinite(lastPointerEventX) || !isFinite(lastPointerEventY)) {
+      lastPointerEventX = point.x
+      lastPointerEventY = point.y
+      return false
+    }
+    if (Math.abs(point.x - lastPointerEventX) < 4
+        && Math.abs(point.y - lastPointerEventY) < 4) return false
+    lastPointerEventX = point.x
+    lastPointerEventY = point.y
+    return true
+  }
+  function settlePointerPlacementRequest(requestId) {
+    if (requestId === pointerPlacementSettingsId) pointerPlacementSettingsId = 0
+    if (requestId === pointerPlacementSearchId) pointerPlacementSearchId = 0
+    maybePlacePointerOverSearchField()
+  }
   function open(payloadJson) {
     noticeMessage = ""
     query = ""; searchField.text = ""; results = []; defaultResults = []; selectedIndex = -1; latestSearchId = 0; searchLoading = false; searchHasMore = false; noResultsState = false; pendingSelectionIndex = -1
+    pointerPlacementGuard.stop(); pointerPlacementPending = true; pointerPlacementScheduled = false; pointerPlacementSettingsId = 0; pointerPlacementSearchId = 0; lastPointerEventX = NaN; lastPointerEventY = NaN
     previewingSelection = false; editingPreviewUrl = false; openUrlRequestId = 0; addUrlRequestId = 0; pendingAddUrl = ""
     mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false; opened = true
     worker.start()
     requestSettings()
     performSearch()
-    Qt.callLater(function() { searchField.forceActiveFocus() })
+    Qt.callLater(function() { searchField.forceActiveFocus(); root.maybePlacePointerOverSearchField() })
   }
-  function close() { opened = false; query = ""; searchField.text = ""; results = []; defaultResults = []; selectedIndex = -1; pendingSelectionIndex = -1; noResultsState = false; previewingSelection = false; editingPreviewUrl = false; openUrlRequestId = 0; addUrlRequestId = 0; pendingAddUrl = ""; mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false; noticeMessage = ""; importPreview = null; pendingLibraryAction = null; if (!libraryBusy) libraryItems = [] }
+  function close() { opened = false; query = ""; searchField.text = ""; results = []; defaultResults = []; selectedIndex = -1; pendingSelectionIndex = -1; noResultsState = false; pointerPlacementGuard.stop(); pointerPlacementPending = false; pointerPlacementScheduled = false; pointerPlacementSettingsId = 0; pointerPlacementSearchId = 0; lastPointerEventX = NaN; lastPointerEventY = NaN; previewingSelection = false; editingPreviewUrl = false; openUrlRequestId = 0; addUrlRequestId = 0; pendingAddUrl = ""; mode = "search"; searchScope = defaultSearchScope; editingBookmark = null; statusMessage = ""; controlHeld = false; altHeld = false; noticeMessage = ""; importPreview = null; pendingLibraryAction = null; if (!libraryBusy) libraryItems = [] }
   // Setup runs in a visible terminal so its verification result can be read.
   // Once that terminal closes, return to the overlay and either start the
   // installed worker or show the setup error again.
@@ -124,6 +167,8 @@ Item {
     if (!query.trim()) { noResultsState = false; results = defaultResults }
     selectedIndex = -1; pendingSelectionIndex = -1; searchHasMore = false; searchLoading = true
     latestSearchId = worker.request({type: "search", query: query, scope: searchScope, limit: resultCount, offset: 0})
+    if (pointerPlacementPending) pointerPlacementSearchId = latestSearchId
+    maybePlacePointerOverSearchField()
   }
   function loadNextSearchPage() {
     if (!query.trim() || searchLoading || !searchHasMore) return
@@ -133,6 +178,8 @@ Item {
   function requestSettings() {
     var requestId = worker.request({type: "get_settings"})
     if (requestId) settingsRequestId = requestId
+    if (pointerPlacementPending) pointerPlacementSettingsId = requestId
+    maybePlacePointerOverSearchField()
   }
   function applySettings(settings) {
     if (!settings) return
@@ -503,6 +550,7 @@ Item {
   }
   function domain(url) { var match = String(url || "").match(/^https?:\/\/([^/]+)(\/.*)?$/i); return match ? match[1] + ((match[2] && match[2] !== "/") ? match[2] : "") : String(url || "") }
   function handleMessage(response) {
+    settlePointerPlacementRequest(response.id)
     var metadataGeneration = metadataRequests[response.id]
     var suggestionGeneration = suggestionRequests[response.id]
     if (!response.ok) {
@@ -754,6 +802,9 @@ Item {
     onMessage: function(response) { root.handleMessage(response) }
   }
   Timer { id: searchDebounce; interval: 35; repeat: false; onTriggered: root.performSearch() }
+  // Keep result rows inert until Hyprland has processed the initial cursor
+  // move; otherwise the cursor passes over them on its way to the field.
+  Timer { id: pointerPlacementGuard; interval: 150; repeat: false; onTriggered: root.pointerPlacementPending = false }
   Process {
     id: workerSetup
     command: ["omarchy-launch-tui", "--app-id=TUI.float", root.workerInstaller, "--pause"]
@@ -929,7 +980,15 @@ Item {
               readonly property bool showingShortcuts: root.controlHeld && index === root.selectedIndex && !modelData.action
               width: topBookmarks.width; height: Style.space(58); radius: root.contentCornerRadius
               color: index === root.selectedIndex ? Color.menu.selectedBackground : "transparent"
-              MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: root.selectedIndex = index; onClicked: root.activateIndex(index) }
+              MouseArea {
+                id: topPointerArea
+                anchors.fill: parent; hoverEnabled: true
+                onPositionChanged: function(event) {
+                  if (!root.pointerPlacementPending && index !== root.selectedIndex
+                      && root.pointerMotionIsIntentional(topPointerArea, event)) root.selectedIndex = index
+                }
+                onClicked: root.activateIndex(index)
+              }
               Text { id: topShortcutHint; textFormat: Text.PlainText; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld; text: (root.altHeld ? "Ctrl+Alt+" : "Ctrl+") + root.resultShortcutKey(index); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
               Column {
                 visible: !parent.showingShortcuts
@@ -972,7 +1031,15 @@ Item {
               readonly property bool showingShortcuts: root.controlHeld && index === root.selectedIndex && !modelData.action
               width: contentColumn.width; height: Style.space(58); radius: root.contentCornerRadius
               color: index === root.selectedIndex ? Color.menu.selectedBackground : "transparent"
-              MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: if (!root.editingPreviewUrl) root.previewSelection(index); onClicked: root.activateIndex(index) }
+              MouseArea {
+                id: resultPointerArea
+                anchors.fill: parent; hoverEnabled: true
+                onPositionChanged: function(event) {
+                  if (!root.pointerPlacementPending && !root.editingPreviewUrl && index !== root.selectedIndex
+                      && root.pointerMotionIsIntentional(resultPointerArea, event)) root.previewSelection(index)
+                }
+                onClicked: root.activateIndex(index)
+              }
               Text { id: shortcutHint; textFormat: Text.PlainText; anchors.right: parent.right; anchors.rightMargin: Style.spacing.md; anchors.verticalCenter: parent.verticalCenter; visible: root.controlHeld && index >= searchResults.visibleStartIndex && index < searchResults.visibleStartIndex + root.resultCount; text: (root.altHeld ? "Ctrl+Alt+" : "Ctrl+") + root.resultShortcutKey(index - searchResults.visibleStartIndex); color: index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text; opacity: 0.55; font.family: Style.font.menuFamily; font.pixelSize: Style.font.caption }
               Column {
                 visible: !parent.showingShortcuts
