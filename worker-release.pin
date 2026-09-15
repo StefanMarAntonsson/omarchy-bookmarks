@@ -8,6 +8,6 @@
 #
 # Empty hashes mean no release is pinned yet; setup then builds from source.
 version=2.0.0
-source=
-x86_64=
-aarch64=
+source=b37cfb816b85a7eeee4a3798039a81249daf0c6b24b6f03de38ab99924ed03fb
+x86_64=87eff32050bec33a2d09b62f932180390291fe74b8484093d77d5184a1e7160d
+aarch64=98bd1b9f23a1d8335eea88e18ac2d5ae82a7e1ff5f3d59bbf66efd22901e22e2
