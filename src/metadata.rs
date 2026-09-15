@@ -3,7 +3,7 @@ use std::{
     fmt,
     io::Read,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
-    sync::{Arc, mpsc},
+    sync::{Arc, OnceLock, mpsc},
     thread,
     time::Duration,
 };
@@ -12,7 +12,7 @@ use regex::Regex;
 use reqwest::{
     blocking::Client,
     dns::{Addrs, Name, Resolve, Resolving},
-    header::CONTENT_TYPE,
+    header::{ACCEPT, CONTENT_TYPE},
     redirect::{Attempt, Policy},
 };
 use serde::Serialize;
@@ -22,6 +22,7 @@ use crate::repository::{MAX_DESCRIPTION, MAX_TITLE};
 
 const MAX_BODY: usize = 1_000_000;
 const MAX_REDIRECTS: usize = 4;
+const READ_CHUNK: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,17 +81,16 @@ fn fetch_with(url: &str, policy: FetchPolicy) -> Result<Metadata, String> {
     let client = builder
         .build()
         .map_err(|_| "Could not create HTTP client")?;
-    let mut response = client.get(parsed).send().map_err(describe_error)?;
+    let mut response = client
+        .get(parsed)
+        .header(ACCEPT, "text/html, application/xhtml+xml")
+        .send()
+        .map_err(describe_error)?;
     if !response.status().is_success() {
         return Err(format!(
             "Page lookup returned HTTP {}",
             response.status().as_u16()
         ));
-    }
-    if let Some(length) = response.content_length()
-        && length > MAX_BODY as u64
-    {
-        return Err("Page is too large to read".into());
     }
     let content_type = response
         .headers()
@@ -101,27 +101,78 @@ fn fetch_with(url: &str, policy: FetchPolicy) -> Result<Metadata, String> {
     if !content_type.contains("text/html") && !content_type.contains("application/xhtml+xml") {
         return Err("Page is not HTML".into());
     }
-    let mut bytes = Vec::new();
-    response
-        .by_ref()
-        .take((MAX_BODY + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "Could not read page")?;
-    if bytes.len() > MAX_BODY {
-        return Err("Page is too large to read".into());
+    let final_url = response.url().to_string();
+    let (title, description) = read_metadata(&mut response)?;
+    Ok(Metadata {
+        title,
+        description,
+        final_url,
+    })
+}
+
+/// Reads only the useful prefix of a decoded HTML response. Content-Length is
+/// deliberately not used as a rejection or allocation hint: it describes the
+/// whole representation, while metadata normally lives in the document head.
+fn read_metadata(reader: &mut impl Read) -> Result<(String, String), String> {
+    let mut bytes = Vec::with_capacity(READ_CHUNK);
+    let mut chunk = [0; READ_CHUNK];
+    loop {
+        let remaining = MAX_BODY - bytes.len();
+        if remaining == 0 {
+            let mut extra = [0];
+            let exceeds_limit = reader.read(&mut extra).map_err(|_| "Could not read page")? != 0;
+            let (title, description) = extract_metadata(&bytes);
+            if exceeds_limit && title.is_empty() && description.is_empty() {
+                return Err("Page metadata was not found within the read limit".into());
+            }
+            return Ok((title, description));
+        }
+
+        let count = reader
+            .read(&mut chunk[..remaining.min(READ_CHUNK)])
+            .map_err(|_| "Could not read page")?;
+        if count == 0 {
+            return Ok(extract_metadata(&bytes));
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+
+        let (title, description) = extract_metadata(&bytes);
+        if (!title.is_empty() && !description.is_empty()) || head_has_ended(&bytes) {
+            return Ok((title, description));
+        }
     }
-    let html = String::from_utf8_lossy(&bytes);
+}
+
+fn extract_metadata(bytes: &[u8]) -> (String, String) {
+    let end = [b"</head".as_slice(), b"<body".as_slice()]
+        .into_iter()
+        .filter_map(|needle| find_ascii_case_insensitive(bytes, needle))
+        .min()
+        .unwrap_or(bytes.len());
+    let html = String::from_utf8_lossy(&bytes[..end]);
     let title = meta(&html, "property", "og:title")
+        .filter(|value| !value.trim().is_empty())
         .or_else(|| title_tag(&html))
         .unwrap_or_default();
     let description = meta(&html, "property", "og:description")
+        .filter(|value| !value.trim().is_empty())
         .or_else(|| meta(&html, "name", "description"))
         .unwrap_or_default();
-    Ok(Metadata {
-        title: decode(&title, MAX_TITLE),
-        description: decode(&description, MAX_DESCRIPTION),
-        final_url: response.url().to_string(),
-    })
+    (
+        decode(&title, MAX_TITLE),
+        decode(&description, MAX_DESCRIPTION),
+    )
+}
+
+fn head_has_ended(bytes: &[u8]) -> bool {
+    find_ascii_case_insensitive(bytes, b"</head").is_some()
+        || find_ascii_case_insensitive(bytes, b"<body").is_some()
+}
+
+fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
 fn describe_error(error: reqwest::Error) -> String {
@@ -257,8 +308,12 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 }
 
 fn meta(html: &str, kind: &str, key: &str) -> Option<String> {
-    let tag = Regex::new(r"(?is)<meta\s+[^>]*>").unwrap();
-    let attr = Regex::new(r#"(?is)([a-z_:.-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')"#).unwrap();
+    static TAG: OnceLock<Regex> = OnceLock::new();
+    static ATTR: OnceLock<Regex> = OnceLock::new();
+    let tag = TAG.get_or_init(|| Regex::new(r"(?is)<meta\s+[^>]*>").unwrap());
+    let attr = ATTR.get_or_init(|| {
+        Regex::new(r#"(?is)([a-z_:.-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')"#).unwrap()
+    });
     for found in tag.find_iter(html) {
         let mut wanted = false;
         let mut content = None;
@@ -284,8 +339,9 @@ fn meta(html: &str, kind: &str, key: &str) -> Option<String> {
     None
 }
 fn title_tag(html: &str) -> Option<String> {
-    Regex::new(r"(?is)<title[^>]*>(.*?)</title>")
-        .unwrap()
+    static TITLE: OnceLock<Regex> = OnceLock::new();
+    TITLE
+        .get_or_init(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").unwrap())
         .captures(html)
         .map(|c| c[1].trim().to_string())
 }
@@ -333,7 +389,7 @@ mod tests {
             let (mut s, _) = l.accept().unwrap();
             let mut b = [0; 1024];
             let _ = s.read(&mut b);
-            s.write_all(response).unwrap();
+            let _ = s.write_all(response);
         });
         format!("http://{addr}/")
     }
@@ -345,7 +401,7 @@ mod tests {
         assert_eq!(m.description, "Desc");
     }
     #[test]
-    fn rejects_oversized() {
+    fn rejects_oversized_without_metadata() {
         let body = "x".repeat(MAX_BODY + 1);
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
@@ -354,7 +410,82 @@ mod tests {
         );
         let leaked = Box::leak(response.into_bytes().into_boxed_slice());
         let u = server(leaked);
-        assert!(fetch_local(&u).unwrap_err().contains("too large"));
+        assert!(fetch_local(&u).unwrap_err().contains("read limit"));
+    }
+    #[test]
+    fn extracts_metadata_from_an_oversized_page_prefix() {
+        let body = format!(
+            "{}<title>Fallback</title><meta property='og:title' content='Early title'><meta name='description' content='Early description'>{}",
+            "x".repeat(MAX_BODY / 2),
+            "x".repeat(MAX_BODY)
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let u = server(Box::leak(response.into_bytes().into_boxed_slice()));
+        let metadata = fetch_local(&u).unwrap();
+        assert_eq!(metadata.title, "Early title");
+        assert_eq!(metadata.description, "Early description");
+    }
+    #[test]
+    fn returns_partial_metadata_when_the_limit_is_reached() {
+        let body = format!("<title>Useful title</title>{}", "x".repeat(MAX_BODY));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let u = server(Box::leak(response.into_bytes().into_boxed_slice()));
+        let metadata = fetch_local(&u).unwrap();
+        assert_eq!(metadata.title, "Useful title");
+        assert!(metadata.description.is_empty());
+    }
+    #[test]
+    fn stops_after_the_document_head() {
+        let mut html = b"<HTML><HEAD><title>Head title</title></HeAd><body><meta name='description' content='Too late'>".to_vec();
+        html.extend_from_slice(&vec![b'x'; READ_CHUNK * 2]);
+        let mut reader = std::io::Cursor::new(html);
+        let (title, description) = read_metadata(&mut reader).unwrap();
+        assert_eq!(title, "Head title");
+        assert!(description.is_empty());
+        assert_eq!(reader.position(), READ_CHUNK as u64);
+    }
+    #[test]
+    fn requests_and_decodes_compressed_html() {
+        const GZIP_HTML: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x6d, 0x8d, 0xb1, 0x0a,
+            0x80, 0x30, 0x0c, 0x05, 0x7f, 0xa5, 0x5b, 0x46, 0x77, 0x69, 0x5d, 0xfc, 0x92, 0xd2,
+            0x3e, 0xb4, 0x60, 0x93, 0x90, 0x66, 0xf1, 0xef, 0x05, 0x75, 0x70, 0x70, 0xbe, 0x3b,
+            0x2e, 0xee, 0xc8, 0x75, 0x89, 0x1d, 0x9e, 0x83, 0x9a, 0x28, 0xcc, 0xcf, 0x44, 0xb2,
+            0xcd, 0xde, 0xfc, 0x00, 0x85, 0x22, 0xec, 0x60, 0x4f, 0xb4, 0x4a, 0x57, 0xc3, 0x18,
+            0xa8, 0xe1, 0x41, 0x6f, 0xc4, 0xb9, 0x23, 0x51, 0xc5, 0x28, 0xd6, 0xd4, 0x9b, 0xf0,
+            0x7f, 0xf3, 0x15, 0x96, 0x38, 0xdd, 0xd7, 0x0b, 0xa1, 0x4b, 0xbb, 0xa5, 0x7c, 0x00,
+            0x00, 0x00,
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let count = stream.read(&mut request).unwrap();
+            request_tx.send(request[..count].to_vec()).unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                GZIP_HTML.len()
+            );
+            stream.write_all(headers.as_bytes()).unwrap();
+            stream.write_all(GZIP_HTML).unwrap();
+        });
+
+        let metadata = fetch_local(&format!("http://{address}/")).unwrap();
+        let request = String::from_utf8(request_rx.recv().unwrap()).unwrap();
+        assert!(request.to_ascii_lowercase().contains("accept-encoding:"));
+        assert!(request.to_ascii_lowercase().contains("gzip"));
+        assert_eq!(metadata.title, "Compressed title");
+        assert_eq!(metadata.description, "Compressed description");
     }
     #[test]
     fn follows_redirect() {

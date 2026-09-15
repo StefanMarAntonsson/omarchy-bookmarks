@@ -398,8 +398,11 @@ network access. When enabled:
 - Proxies from the environment are ignored; no cookies, credentials, or
   referrer are sent.
 - Timeouts are three seconds to resolve and connect and eight seconds overall.
-  At most 1 MiB is read, only `text/html` or `application/xhtml+xml` responses
-  are accepted, and at most two lookups run at once.
+  Compressed responses are decoded incrementally, at most 1,000,000 decoded
+  HTML bytes are inspected, and reading stops once useful head metadata is
+  complete.
+  Only `text/html` or `application/xhtml+xml` responses are accepted, and at
+  most two lookups run at once.
 - Title and description are reduced to single-line plain text of at most
   2,048 characters. Error messages never echo remote content.
 
