@@ -264,7 +264,7 @@ omarchy-shell shell toggle stefanmara.bookmarks '{}'
 | `Ctrl+E` | Edit the selected bookmark |
 | `Ctrl+D` | Request deletion of the selected bookmark; `Enter` confirms |
 | `Ctrl+C` | Copy the selected URL |
-| `Escape` | Restore the search from a URL preview/edit; press again to close |
+| `Escape` | Step back from a URL preview/edit to the search, clear a non-empty search, then close from the empty view |
 
 Settings use the same in-card form as adding a bookmark. They control the
 default search scope, whether an empty search shows the most-used (the default)

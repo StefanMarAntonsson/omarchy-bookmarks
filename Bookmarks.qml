@@ -318,6 +318,11 @@ Item {
     searchField.text = query
     searchField.cursorPosition = searchField.text.length
   }
+  function clearSearchQuery() {
+    query = ""; searchField.text = ""; selectedIndex = -1; pendingSelectionIndex = -1; statusMessage = ""; noticeMessage = ""
+    searchHasMore = false; searchLoading = true; results = defaultResults; noResultsState = false
+    searchDebounce.restart()
+  }
   function previewSelection(index) {
     if (index < 0 || index >= results.length) return
     selectedIndex = index
@@ -891,7 +896,7 @@ Item {
             font.pixelSize: Style.font.bodySmall
           }
           Rectangle {
-            visible: root.previewingSelection || root.editingPreviewUrl
+            visible: root.previewingSelection || root.editingPreviewUrl || root.query.length > 0
             anchors.left: parent.left; anchors.leftMargin: Style.spacing.sm
             anchors.top: parent.top; anchors.topMargin: -height / 2
             width: escapeHint.implicitWidth + Style.space(8); height: escapeHint.implicitHeight
@@ -920,6 +925,7 @@ Item {
             var directSlot = root.resultShortcutSlot(event.key)
             root.updateModifierState(event, true)
             if (event.key === Qt.Key_Escape && (root.previewingSelection || root.editingPreviewUrl)) { root.restoreSearchQuery(); event.accepted = true }
+            else if (event.key === Qt.Key_Escape && root.query.length > 0) { root.clearSearchQuery(); event.accepted = true }
             else if (event.key === Qt.Key_Escape) { root.dismiss(); event.accepted = true }
             else if (event.key === Qt.Key_Tab && event.modifiers === Qt.NoModifier) { root.toggleSearchScope(); event.accepted = true }
             else if (!root.query.trim() && event.key === Qt.Key_Up) { root.moveTopSelection(-1); event.accepted = true }

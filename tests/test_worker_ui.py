@@ -140,6 +140,28 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn('id: escapeHint', self.ui)
         self.assertIn('text: "esc"', self.ui)
 
+    def test_escape_unwinds_preview_query_and_empty_search_in_order(self):
+        self.assertIn("function clearSearchQuery()", self.ui)
+        clear_start = self.ui.index("function clearSearchQuery()")
+        clear_end = self.ui.index("\n  }", clear_start)
+        clear_region = self.ui[clear_start:clear_end]
+        self.assertIn('query = ""; searchField.text = ""', clear_region)
+        self.assertIn("results = defaultResults", clear_region)
+        self.assertIn("searchDebounce.restart()", clear_region)
+
+        preview_escape = (
+            "event.key === Qt.Key_Escape && "
+            "(root.previewingSelection || root.editingPreviewUrl)"
+        )
+        query_escape = "event.key === Qt.Key_Escape && root.query.length > 0"
+        dismiss_escape = "event.key === Qt.Key_Escape) { root.dismiss()"
+        self.assertLess(self.ui.index(preview_escape), self.ui.index(query_escape))
+        self.assertLess(self.ui.index(query_escape), self.ui.index(dismiss_escape))
+        self.assertIn(
+            "visible: root.previewingSelection || root.editingPreviewUrl || root.query.length > 0",
+            self.ui,
+        )
+
     def test_query_matches_are_highlighted_without_rich_text(self):
         self.assertIn("component HighlightedText: Item", self.ui)
         self.assertIn("sourceLower.indexOf(searchLower, cursor)", self.ui)
