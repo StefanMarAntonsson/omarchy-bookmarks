@@ -662,7 +662,10 @@ Item {
     }
     if (deleteRequestId && response.id === deleteRequestId) {
       deleteRequestId = 0
-      if (result.deleted) { mode = "search"; editingBookmark = null; restoreSearchQuery(); performSearch() }
+      if (result.deleted) {
+        mode = "search"; editingBookmark = null; restoreSearchQuery(); performSearch()
+        Qt.callLater(function() { searchField.forceActiveFocus() })
+      }
       else statusMessage = "Bookmark no longer exists"
     }
   }

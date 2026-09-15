@@ -428,6 +428,20 @@ class WorkerUiContractTests(unittest.TestCase):
         self.assertIn('type: "delete", bookmark_id: editingBookmark.id', self.ui)
         self.assertIn("if (deleteRequestId || !editingBookmark) return", self.ui)
 
+    def test_successful_delete_restores_search_focus(self):
+        delete_result_start = self.ui.index(
+            "if (deleteRequestId && response.id === deleteRequestId)",
+            self.ui.index("var result = response.result || {}"),
+        )
+        delete_result_end = self.ui.index("\n    }", delete_result_start)
+        delete_result_region = self.ui[delete_result_start:delete_result_end]
+        self.assertIn('if (result.deleted) {', delete_result_region)
+        self.assertIn('mode = "search"', delete_result_region)
+        self.assertIn(
+            "Qt.callLater(function() { searchField.forceActiveFocus() })",
+            delete_result_region,
+        )
+
     def test_untrusted_titles_are_plain_text(self):
         position = self.ui.index("text: modelData.title || root.domain(modelData.originalUrl)")
         self.assertIn("textFormat: Text.PlainText", self.ui[position:position + 1000])
